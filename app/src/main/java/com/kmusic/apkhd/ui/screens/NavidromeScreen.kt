@@ -54,10 +54,9 @@ fun NavidromeScreen(
     trackCount: Int,
     albumCount: Int,
     artistCount: Int,
-    playlistCount: Int,
     onOpenAlbums: () -> Unit,
     onOpenArtists: () -> Unit,
-    onOpenPlaylists: () -> Unit,
+    onOpenSongs: () -> Unit,
     onReconnect: () -> Unit,
     onRefresh: () -> Unit,
     onOpenSettings: () -> Unit,
@@ -193,7 +192,7 @@ fun NavidromeScreen(
                 NavEntry(IconArtist, "歌手", "$artistCount 位", connected, onOpenArtists)
             }
             item {
-                NavEntry(IconPlaylist, "播放列表", "$playlistCount 个", connected, onOpenPlaylists)
+                NavEntry(IconPlaylist, "所有歌曲", "$trackCount 首", connected, onOpenSongs)
             }
             item {
                 Column(Modifier.padding(horizontal = 16.wdp, vertical = 8.wdp)) {

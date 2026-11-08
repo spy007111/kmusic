@@ -2701,6 +2701,22 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         return decoded.substringAfterLast('/').substringAfterLast(':').ifBlank { decoded }
     }
 
+    /** 「所有歌曲」页的数据与加载态 */
+    var navidromeAllTracks by mutableStateOf<List<Track>>(emptyList())
+        private set
+    var navidromeAllLoading by mutableStateOf(false)
+        private set
+
+    /** 拉全库歌曲（进「所有歌曲」页时调用） */
+    fun loadNavidromeAllSongs() {
+        val c = navidrome ?: return
+        viewModelScope.launch {
+            navidromeAllLoading = true
+            navidromeAllTracks = c.allSongs()
+            navidromeAllLoading = false
+        }
+    }
+
     fun refreshNavidrome() {
         val c = navidrome ?: return
         viewModelScope.launch {

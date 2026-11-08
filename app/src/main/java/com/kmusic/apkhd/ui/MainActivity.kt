@@ -81,6 +81,8 @@ import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.icons.IconDownload
 import com.kmusic.apkhd.ui.icons.IconFolder
 import com.kmusic.apkhd.ui.icons.IconPlay
+import com.kmusic.apkhd.ui.icons.IconPlayShuffle
+import com.kmusic.apkhd.ui.icons.IconPlayOrder
 import com.kmusic.apkhd.ui.screens.ListAction
 import com.kmusic.apkhd.model.AlbumBrief
 import com.kmusic.apkhd.model.Track
@@ -180,7 +182,7 @@ private sealed interface Route {
     data object Navidrome : Route
     data object NavidromeAlbums : Route
     data object NavidromeArtists : Route
-    data object NavidromePlaylists : Route
+    data object NavidromeSongs : Route
     data object Downloads : Route
     data class Chart(val section: ChartSection) : Route
     data class Playlist(val brief: PlaylistBrief) : Route
@@ -530,7 +532,7 @@ fun MoyinRoot() {
                                 ListAction("下载全部", IconDownload) { vm.downloadAll(vm.collectionTracks) }
                             ),
                             onTrackClick = { t, list -> vm.play(t, list); showPlayer = true },
-                            onBack = { vm.closeCollection(); route = Route.NavidromePlaylists }
+                            onBack = { vm.closeCollection(); route = Route.None }
                         )
                         is Route.KwAlbum -> TrackListScreen(
                             title = vm.albumTitle.ifEmpty { "专辑" },
@@ -615,10 +617,9 @@ fun MoyinRoot() {
                             trackCount = vm.navidromeTrackCount,
                             albumCount = vm.navidromeAlbums.size,
                             artistCount = vm.navidromeArtists.size,
-                            playlistCount = vm.navidromePlaylists.size,
                             onOpenAlbums = { vm.refreshNavidrome(); route = Route.NavidromeAlbums },
                             onOpenArtists = { vm.refreshNavidrome(); route = Route.NavidromeArtists },
-                            onOpenPlaylists = { vm.refreshNavidrome(); route = Route.NavidromePlaylists },
+                            onOpenSongs = { vm.loadNavidromeAllSongs(); route = Route.NavidromeSongs },
                             onReconnect = { vm.retryNavidrome() },
                             onRefresh = { vm.refreshNavidrome() },
                             onOpenSettings = { tab = 3; route = Route.None },
@@ -645,14 +646,23 @@ fun MoyinRoot() {
                             },
                             onBack = { route = Route.None }
                         )
-                        is Route.NavidromePlaylists -> CollectionListScreen(
-                            title = "播放列表",
-                            items = vm.playlistItems,
-                            emptyText = if (vm.navidromeConnected) "曲库里没有播放列表" else "还没连接曲库",
-                            onItemClick = { item ->
-                                vm.openPlaylist(item.id, item.title)
-                                route = Route.NdPlaylist(item.id, item.title)
-                            },
+                        is Route.NavidromeSongs -> TrackListScreen(
+                            title = "所有歌曲",
+                            tracks = vm.navidromeAllTracks,
+                            emptyText = if (vm.navidromeAllLoading) "加载中…" else "曲库里没有歌曲",
+                            loading = vm.navidromeAllLoading,
+                            actions = listOf(
+                                ListAction("顺序播放", IconPlayOrder) {
+                                    vm.changePlayMode(com.kmusic.apkhd.model.PlayMode.ORDER)
+                                    vm.playAll(vm.navidromeAllTracks); showPlayer = true
+                                },
+                                ListAction("随机播放", IconPlayShuffle) {
+                                    vm.changePlayMode(com.kmusic.apkhd.model.PlayMode.SHUFFLE)
+                                    vm.playAll(vm.navidromeAllTracks); showPlayer = true
+                                },
+                                ListAction("下载全部", IconDownload) { vm.downloadAll(vm.navidromeAllTracks) }
+                            ),
+                            onTrackClick = { t, list -> vm.play(t, list); showPlayer = true },
                             onBack = { route = Route.None }
                         )
                         is Route.WebDav -> WebDavScreen(

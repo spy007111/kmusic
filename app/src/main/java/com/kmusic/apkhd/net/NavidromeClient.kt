@@ -55,24 +55,54 @@ class NavidromeClient(
                 val j = get("search3", mapOf("query" to query, "songCount" to limit.toString()))
                 val songs = j.optJSONObject("searchResult3")?.optJSONArray("song") ?: return@withContext emptyList()
                 (0 until songs.length()).mapNotNull { i ->
-                    val s = songs.optJSONObject(i) ?: return@mapNotNull null
-                    com.kmusic.apkhd.model.Track(
-                        id = "nd:${s.optString("id")}",
-                        name = s.optString("title").ifBlank { "未知曲目" },
-                        artist = s.optString("artist").ifBlank { "未知歌手" },
-                        album = s.optString("album").ifBlank { "" },
-                        coverUrl = coverUrl(s.optString("id")),
-                        durationMs = (s.optDouble("duration", 0.0) * 1000).toLong(),
-                        source = "navidrome",
-                        sourceId = s.optString("id"),
-                        qualityLabel = suffixToQuality(s.optString("suffix")),
-                        playUrl = streamUrl(s.optString("id"))
-                    )
+                    songs.optJSONObject(i)?.let { songJsonToTrack(it) }
                 }
             } catch (_: Exception) {
                 emptyList()
             }
         }
+
+    /**
+     * 曲库全部歌曲 —— search3 空查询 + songOffset 翻页。
+     * Navidrome 对空 query 返回全库；页大小 500，5000 封顶防失控（单曲库 5k 以上的人
+     * 一般也不会「整库随机播放」）。
+     */
+    suspend fun allSongs(pageSize: Int = 500, maxTotal: Int = 5000): List<com.kmusic.apkhd.model.Track> =
+        withContext(Dispatchers.IO) {
+            if (!isConfigured) return@withContext emptyList()
+            val out = ArrayList<com.kmusic.apkhd.model.Track>(pageSize)
+            var offset = 0
+            try {
+                while (out.size < maxTotal) {
+                    val j = get("search3", mapOf(
+                        "query" to "",
+                        "songCount" to pageSize.toString(),
+                        "songOffset" to offset.toString()
+                    ))
+                    val songs = j.optJSONObject("searchResult3")?.optJSONArray("song") ?: break
+                    if (songs.length() == 0) break
+                    for (i in 0 until songs.length()) {
+                        songs.optJSONObject(i)?.let { out.add(songJsonToTrack(it)) }
+                    }
+                    if (songs.length() < pageSize) break
+                    offset += songs.length()
+                }
+            } catch (_: Exception) { /* 拿到多少算多少 */ }
+            out
+        }
+
+    private fun songJsonToTrack(s: org.json.JSONObject) = com.kmusic.apkhd.model.Track(
+        id = "nd:${s.optString("id")}",
+        name = s.optString("title").ifBlank { "未知曲目" },
+        artist = s.optString("artist").ifBlank { "未知歌手" },
+        album = s.optString("album").ifBlank { "" },
+        coverUrl = coverUrl(s.optString("id")),
+        durationMs = (s.optDouble("duration", 0.0) * 1000).toLong(),
+        source = "navidrome",
+        sourceId = s.optString("id"),
+        qualityLabel = suffixToQuality(s.optString("suffix")),
+        playUrl = streamUrl(s.optString("id"))
+    )
 
     /** 专辑列表 */
     suspend fun albums(type: String = "newest", size: Int = 30): List<AlbumInfo> =
