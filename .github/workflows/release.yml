@@ -28,6 +28,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # 用 setup-gradle 装发行包：自带重试 + 缓存（wrapper 直连经常 10s 超时失败）
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.1.0'
+
       # 直接拉 commandline-tools 自己装：比第三方 action 少一层版本漂移
       - name: Set up Android SDK
         run: |
@@ -49,7 +54,7 @@ jobs:
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           chmod +x gradlew
           set -o pipefail
-          ./gradlew :app:assembleDebug --no-daemon --stacktrace \
+          gradle :app:assembleDebug --no-daemon --stacktrace \
             -Pkotlin.compiler.execution.strategy=in-process 2>&1 | tee /tmp/build.log
 
       # 失败时把编译日志塞进 run 的 Summary（公开可见，不用登录捞日志）
