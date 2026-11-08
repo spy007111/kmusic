@@ -32,8 +32,12 @@ jobs:
       - name: Install Gradle
         run: |
           set -eu
-          curl -sSL --retry 6 --retry-delay 5 --retry-all-errors \
-            -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-9.1.0-bin.zip
+          # -f 必须有：不加的话 5xx 错误页会被当成 zip 存下来，unzip 报 exit 9
+          curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors \
+            -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-9.1.0-bin.zip \
+          || curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors \
+            -o /tmp/gradle.zip https://downloads.gradle.org/distributions/gradle-9.1.0-bin.zip
+          test -s /tmp/gradle.zip
           unzip -q /tmp/gradle.zip -d "$HOME"
           echo "$HOME/gradle-9.1.0/bin" >> "$GITHUB_PATH"
           "$HOME/gradle-9.1.0/bin/gradle" --version
