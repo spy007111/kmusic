@@ -34,7 +34,6 @@ import com.kmusic.apkhd.model.QuickEntry
 import com.kmusic.apkhd.model.ChartSection
 import com.kmusic.apkhd.model.PlaylistBrief
 import com.kmusic.apkhd.model.ArtistBrief
-import com.kmusic.apkhd.net.AlbumInfo
 import com.kmusic.apkhd.model.Track
 import com.kmusic.apkhd.ui.components.CoverArt
 import androidx.compose.foundation.border
@@ -77,8 +76,8 @@ fun HomeScreen(
     charts: List<ChartSection> = emptyList(),
     playlists: List<PlaylistBrief> = emptyList(),
     artists: List<ArtistBrief> = emptyList(),
-    /** Navidrome 曲库最新专辑：空列表 = 首页不显示这个板块 */
-    ndAlbums: List<AlbumInfo> = emptyList(),
+    /** Navidrome 曲库歌曲：空列表 = 首页不显示这个板块 */
+    ndTracks: List<Track> = emptyList(),
     onSearchClick: () -> Unit,
     onEntryClick: (QuickEntry) -> Unit,
     onTrackClick: (Track, List<Track>) -> Unit,
@@ -94,8 +93,10 @@ fun HomeScreen(
     /** 长按卡片收藏 / 取消收藏 */
     onTogglePlaylistFavorite: (PlaylistBrief) -> Unit = {},
     onArtistClick: (ArtistBrief) -> Unit = {},
-    onNdAlbumClick: (AlbumInfo) -> Unit = {},
-    onNdSeeAll: () -> Unit = {},
+    onNdTrackClick: (Track, List<Track>) -> Unit = { _, _ -> },
+    onNdPlayOrder: () -> Unit = {},
+    onNdPlayShuffle: () -> Unit = {},
+    onNdSync: () -> Unit = {},
     /** 换一批（推荐歌单 + 音乐人） */
     onRefreshPlaylists: () -> Unit = {},
     onRefreshArtists: () -> Unit = {},
@@ -458,22 +459,18 @@ fun HomeScreen(
                 }
             }
 
-            // ---- Navidrome 曲库（自建服务器的最新专辑） ----
-            if (ndAlbums.isNotEmpty()) {
+            // ---- Navidrome 曲库（自建服务器：歌曲 + 一键起播/同步） ----
+            if (ndTracks.isNotEmpty()) {
                 run {
                     Spacer(Modifier.height(22.wdp))
                     SectionHeader(
                         text = "Navidrome 曲库",
                         trailing = {
-                            Text(
-                                "查看全部",
-                                color = c.t3,
-                                fontSize = 12.wsp,
-                                modifier = Modifier.clickable(
-                                    indication = null,
-                                    interactionSource = remember { MutableInteractionSource() }
-                                ) { onNdSeeAll() }
-                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.wdp)) {
+                                NdActionPill("顺序播放", onNdPlayOrder)
+                                NdActionPill("随机播放", onNdPlayShuffle)
+                                NdActionPill("同步", onNdSync)
+                            }
                         }
                     )
                     Spacer(Modifier.height(12.wdp))
@@ -483,11 +480,11 @@ fun HomeScreen(
                         horizontalArrangement = Arrangement.spacedBy(12.wdp),
                         modifier = Modifier.tvRowFocus()
                     ) {
-                        itemsIndexed(ndAlbums) { i, a ->
-                            NdAlbumCard(
-                                album = a,
-                                onClick = { onNdAlbumClick(a) },
-                                modifier = Modifier.tvRowItemEdge(i, ndAlbums.size)
+                        itemsIndexed(ndTracks) { i, t ->
+                            NdTrackCard(
+                                track = t,
+                                onClick = { onNdTrackClick(t, ndTracks) },
+                                modifier = Modifier.tvRowItemEdge(i, ndTracks.size)
                             )
                         }
                     }
@@ -978,10 +975,10 @@ private fun ArtistCircle(
     }
 }
 
-/** Navidrome 专辑卡（与推荐歌单同尺寸，封面 + 专辑名 + 歌手） */
+/** Navidrome 歌曲卡（与推荐歌单同尺寸，封面 + 歌名 + 歌手） */
 @Composable
-private fun NdAlbumCard(
-    album: AlbumInfo,
+private fun NdTrackCard(
+    track: Track,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -1001,9 +998,9 @@ private fun NdAlbumCard(
                 .clip(RoundedCornerShape(c.radiusCard))
                 .background(androidx.compose.ui.graphics.Brush.linearGradient(c.coverGrad))
         ) {
-            if (!album.coverUrl.isNullOrEmpty()) {
+            if (!track.coverUrl.isNullOrEmpty()) {
                 CoverArt(
-                    coverUrl = album.coverUrl,
+                    coverUrl = track.coverUrl,
                     modifier = Modifier.fillMaxSize(),
                     cornerRadius = coverRadiusOf(c)
                 )
@@ -1011,21 +1008,39 @@ private fun NdAlbumCard(
         }
         Spacer(Modifier.height(8.wdp))
         Text(
-            album.name,
+            track.name,
             color = c.t1,
             fontSize = 13.wsp,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
-        if (album.artist.isNotBlank()) {
+        if (track.artist.isNotBlank()) {
             Spacer(Modifier.height(2.wdp))
             Text(
-                album.artist,
+                track.artist,
                 color = c.t3,
                 fontSize = 11.wsp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
         }
+    }
+}
+
+/** Navidrome 板块标题右侧的小胶囊按钮（顺序播放/随机播放/同步） */
+@Composable
+private fun NdActionPill(text: String, onClick: () -> Unit) {
+    val c = moyinColors()
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(99.wdp))
+            .background(c.s2)
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() }
+            ) { onClick() }
+            .padding(horizontal = 10.wdp, vertical = 5.wdp)
+    ) {
+        Text(text, color = c.t2, fontSize = 11.wsp)
     }
 }

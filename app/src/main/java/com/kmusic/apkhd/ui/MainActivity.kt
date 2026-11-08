@@ -765,11 +765,14 @@ fun MoyinRoot() {
                                 },
                                 onMyPlaylistsClick = { route = Route.MyPlaylists },
                                 onNavidromeClick = { route = Route.Navidrome },
-                                onNdAlbumClick = { a ->
-                                    vm.openAlbum(a.id, a.name)
-                                    route = Route.NdAlbum(a.id, a.name)
+                                onNdTrackClick = { t, list -> vm.play(t, list); showPlayer = true },
+                                onNdPlayOrder = {
+                                    vm.playNavidromeAll(com.kmusic.apkhd.model.PlayMode.ORDER) { showPlayer = true }
                                 },
-                                onNdSeeAll = { route = Route.NavidromeAlbums }
+                                onNdPlayShuffle = {
+                                    vm.playNavidromeAll(com.kmusic.apkhd.model.PlayMode.SHUFFLE) { showPlayer = true }
+                                },
+                                onNdSync = { vm.syncNavidrome() }
                             )
                             1 -> {
                                 vm.loadHotKeywords()
@@ -1187,8 +1190,10 @@ private fun HomeContent(
     onDailyClick: () -> Unit,
     onMyPlaylistsClick: () -> Unit = {},
     onNavidromeClick: () -> Unit = {},
-    onNdAlbumClick: (com.kmusic.apkhd.net.AlbumInfo) -> Unit = {},
-    onNdSeeAll: () -> Unit = {}
+    onNdTrackClick: (Track, List<Track>) -> Unit = { _, _ -> },
+    onNdPlayOrder: () -> Unit = {},
+    onNdPlayShuffle: () -> Unit = {},
+    onNdSync: () -> Unit = {}
 ) {
     // 四个入口：今日推荐 / 我喜欢的音乐 / 本地音乐 / 收藏的歌单。
     // WebDAV 仍留在媒体库（它是「来源」，不是每天要点的东西）。
@@ -1232,9 +1237,11 @@ private fun HomeContent(
         isPlaylistFavorite = isPlaylistFavorite,
         onTogglePlaylistFavorite = onTogglePlaylistFavorite,
         onArtistClick = onArtistClick,
-        ndAlbums = if (vm.navidromeConnected) vm.navidromeAlbums else emptyList(),
-        onNdAlbumClick = onNdAlbumClick,
-        onNdSeeAll = onNdSeeAll,
+        ndTracks = if (vm.navidromeConnected) vm.navidromeHomeTracks else emptyList(),
+        onNdTrackClick = onNdTrackClick,
+        onNdPlayOrder = onNdPlayOrder,
+        onNdPlayShuffle = onNdPlayShuffle,
+        onNdSync = onNdSync,
         onRefreshPlaylists = { vm.refreshPlaylists() },
         onRefreshArtists = { vm.refreshArtists() },
         playlistsRefreshing = vm.playlistsRefreshing,

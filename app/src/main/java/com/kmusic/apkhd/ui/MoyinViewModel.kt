@@ -2701,11 +2701,44 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         return decoded.substringAfterLast('/').substringAfterLast(':').ifBlank { decoded }
     }
 
+    /** 首页 Navidrome 板块：曲库歌曲（前 60 首，够一屏横滑） */
+    var navidromeHomeTracks by mutableStateOf<List<Track>>(emptyList())
+        private set
+
     /** 「所有歌曲」页的数据与加载态 */
     var navidromeAllTracks by mutableStateOf<List<Track>>(emptyList())
         private set
     var navidromeAllLoading by mutableStateOf(false)
         private set
+
+    /**
+     * 首页「顺序播放 / 随机播放」：先切播放模式，再把全库铺成队列起播。
+     * 全库已加载就直接用；没加载先拉（224 首这种规模一次请求的事）。
+     */
+    fun playNavidromeAll(mode: com.kmusic.apkhd.model.PlayMode, onStarted: () -> Unit = {}) {
+        val c = navidrome ?: run { toast("还没连接曲库"); return }
+        changePlayMode(mode)
+        if (navidromeAllTracks.isNotEmpty()) {
+            playAll(navidromeAllTracks)
+            onStarted()
+            return
+        }
+        viewModelScope.launch {
+            val all = c.allSongs()
+            navidromeAllTracks = all
+            if (all.isEmpty()) { toast("曲库里没有歌曲"); return@launch }
+            playAll(all)
+            onStarted()
+        }
+    }
+
+    /** 首页「同步歌曲」：服务器加歌后点一下，数量/首页歌曲/所有歌曲全部重拉 */
+    fun syncNavidrome() {
+        if (navidrome == null) { toast("还没连接曲库"); return }
+        toast("正在同步曲库…")
+        refreshNavidrome()
+        if (navidromeAllTracks.isNotEmpty()) loadNavidromeAllSongs()
+    }
 
     /** 拉全库歌曲（进「所有歌曲」页时调用） */
     fun loadNavidromeAllSongs() {
@@ -2723,6 +2756,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             navidromeAlbums = c.albums()
             navidromeArtists = c.artists()
             navidromePlaylists = c.playlists()
+            navidromeHomeTracks = c.searchSongs("", 60)
             // getScanStatus 拿不到（老服务器/权限问题）时，用刚拉到的专辑 songCount 兜底
             navidromeTrackCount = c.stats().first.let { n ->
                 if (n > 0) n else navidromeAlbums.sumOf { a -> a.songCount }
