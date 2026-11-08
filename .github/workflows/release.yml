@@ -28,15 +28,17 @@ jobs:
       # 直接拉 commandline-tools 自己装：比第三方 action 少一层版本漂移
       - name: Set up Android SDK
         run: |
-          set -euo pipefail
+          set -eu
           export ANDROID_HOME="$HOME/android-sdk"
           mkdir -p "$ANDROID_HOME/cmdline-tools"
           cd "$ANDROID_HOME/cmdline-tools"
           curl -sSL -o tools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q tools.zip
           mv cmdline-tools latest
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
-            "platform-tools" "platforms;android-36" "build-tools;36.0.0" > /dev/null
+          # 注意别开 pipefail：`yes` 被 sdkmanager 读完会 SIGPIPE(141)，pipefail 会让整步失败
+          ( yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$ANDROID_HOME" \
+              "platform-tools" "platforms;android-36" "build-tools;36.0.0" ) > /tmp/sdk.log 2>&1 || {
+              tail -40 /tmp/sdk.log; exit 1; }
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
 
       - name: Assemble debug APK
