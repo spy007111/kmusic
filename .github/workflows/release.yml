@@ -54,8 +54,17 @@ jobs:
           echo "sdk.dir=$ANDROID_HOME" > local.properties
           chmod +x gradlew
           set -o pipefail
-          gradle :app:assembleDebug --no-daemon --stacktrace \
-            -Pkotlin.compiler.execution.strategy=in-process 2>&1 | tee /tmp/build.log
+          # jitpack（jellyfin ffmpeg 解码器）偶发超时/429，构建整个重试 3 次
+          for attempt in 1 2 3; do
+            echo "=== attempt $attempt ===" >> /tmp/build.log
+            if gradle :app:assembleDebug --no-daemon --stacktrace \
+                 -Pkotlin.compiler.execution.strategy=in-process 2>&1 | tee -a /tmp/build.log; then
+              exit 0
+            fi
+            echo "attempt $attempt failed, retry in 30s"
+            sleep 30
+          done
+          exit 1
 
       # 失败时把编译日志塞进 run 的 Summary（公开可见，不用登录捞日志）
       - name: Dump build log
@@ -66,6 +75,7 @@ jobs:
           tail -80 /tmp/build.log >> "$GITHUB_STEP_SUMMARY" || true
           echo "log lines: $(wc -l < /tmp/build.log 2>/dev/null || echo 0)" >> "$GITHUB_STEP_SUMMARY"
           # 同时转成 annotation（可匿名通过 API 读取，方便定位）
+          grep -E "Could not resolve|Could not GET|Could not download|BUILD FAILED|What went wrong" /tmp/build.log | tail -6 | tr '\n' ' ' | cut -c1-900 | sed 's/^/::error title=build-cause::/'
           tail -12 /tmp/build.log | tr '\n' ' ' | cut -c1-900 | sed 's/^/::error title=build-tail::/'
           
           echo '```' >> "$GITHUB_STEP_SUMMARY"
