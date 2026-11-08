@@ -248,10 +248,12 @@ class NavidromeClient(
 
     /** 统计：曲库总量（用于媒体库页显示「N 首」） */
     suspend fun stats(): Triple<Int, Int, Int> = withContext(Dispatchers.IO) {
-        // (曲目, 专辑, 歌手) —— Subsonic 没有单一统计端点，用列表接口数量近似
+        // (曲目, 专辑, 歌手) —— 曲库总量用 getScanStatus 的 count。
+        // 旧写法读 searchResult3.total：Subsonic/OpenSubsonic 都**没有**这个字段，
+        // 结果恒为 0，界面就一直是「已连接 · 0 首」。
         val songs = try {
-            val j = get("search3", mapOf("query" to "", "songCount" to "1"))
-            j.optJSONObject("searchResult3")?.optInt("total", 0) ?: 0
+            val j = get("getScanStatus", emptyMap())
+            j.optJSONObject("scanStatus")?.optInt("count", 0) ?: 0
         } catch (_: Exception) { 0 }
         Triple(songs, 0, 0)
     }

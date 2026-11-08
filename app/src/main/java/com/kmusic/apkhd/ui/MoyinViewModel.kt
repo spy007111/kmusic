@@ -2707,7 +2707,10 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             navidromeAlbums = c.albums()
             navidromeArtists = c.artists()
             navidromePlaylists = c.playlists()
-            navidromeTrackCount = c.stats().first
+            // getScanStatus 拿不到（老服务器/权限问题）时，用刚拉到的专辑 songCount 兜底
+            navidromeTrackCount = c.stats().first.let { n ->
+                if (n > 0) n else navidromeAlbums.sumOf { a -> a.songCount }
+            }
         }
     }
 

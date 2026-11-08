@@ -34,6 +34,7 @@ import com.kmusic.apkhd.model.QuickEntry
 import com.kmusic.apkhd.model.ChartSection
 import com.kmusic.apkhd.model.PlaylistBrief
 import com.kmusic.apkhd.model.ArtistBrief
+import com.kmusic.apkhd.net.AlbumInfo
 import com.kmusic.apkhd.model.Track
 import com.kmusic.apkhd.ui.components.CoverArt
 import androidx.compose.foundation.border
@@ -76,6 +77,8 @@ fun HomeScreen(
     charts: List<ChartSection> = emptyList(),
     playlists: List<PlaylistBrief> = emptyList(),
     artists: List<ArtistBrief> = emptyList(),
+    /** Navidrome 曲库最新专辑：空列表 = 首页不显示这个板块 */
+    ndAlbums: List<AlbumInfo> = emptyList(),
     onSearchClick: () -> Unit,
     onEntryClick: (QuickEntry) -> Unit,
     onTrackClick: (Track, List<Track>) -> Unit,
@@ -91,6 +94,8 @@ fun HomeScreen(
     /** 长按卡片收藏 / 取消收藏 */
     onTogglePlaylistFavorite: (PlaylistBrief) -> Unit = {},
     onArtistClick: (ArtistBrief) -> Unit = {},
+    onNdAlbumClick: (AlbumInfo) -> Unit = {},
+    onNdSeeAll: () -> Unit = {},
     /** 换一批（推荐歌单 + 音乐人） */
     onRefreshPlaylists: () -> Unit = {},
     onRefreshArtists: () -> Unit = {},
@@ -447,6 +452,42 @@ fun HomeScreen(
                                             .focusProperties { up = refreshArFocus }
                                         else Modifier
                                     )
+                            )
+                        }
+                    }
+                }
+            }
+
+            // ---- Navidrome 曲库（自建服务器的最新专辑） ----
+            if (ndAlbums.isNotEmpty()) {
+                run {
+                    Spacer(Modifier.height(22.wdp))
+                    SectionHeader(
+                        text = "Navidrome 曲库",
+                        trailing = {
+                            Text(
+                                "查看全部",
+                                color = c.t3,
+                                fontSize = 12.wsp,
+                                modifier = Modifier.clickable(
+                                    indication = null,
+                                    interactionSource = remember { MutableInteractionSource() }
+                                ) { onNdSeeAll() }
+                            )
+                        }
+                    )
+                    Spacer(Modifier.height(12.wdp))
+                }
+                run {
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(12.wdp),
+                        modifier = Modifier.tvRowFocus()
+                    ) {
+                        itemsIndexed(ndAlbums) { i, a ->
+                            NdAlbumCard(
+                                album = a,
+                                onClick = { onNdAlbumClick(a) },
+                                modifier = Modifier.tvRowItemEdge(i, ndAlbums.size)
                             )
                         }
                     }
@@ -934,5 +975,57 @@ private fun ArtistCircle(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
+    }
+}
+
+/** Navidrome 专辑卡（与推荐歌单同尺寸，封面 + 专辑名 + 歌手） */
+@Composable
+private fun NdAlbumCard(
+    album: AlbumInfo,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val c = moyinColors()
+    Column(
+        modifier = modifier
+            .width(132.wdp)
+            .tvFocusArea(height = 132.wdp, cornerRadius = coverRadiusOf(c))
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() }
+            ) { onClick() }
+    ) {
+        Box(
+            Modifier
+                .size(132.wdp)
+                .clip(RoundedCornerShape(c.radiusCard))
+                .background(androidx.compose.ui.graphics.Brush.linearGradient(c.coverGrad))
+        ) {
+            if (!album.coverUrl.isNullOrEmpty()) {
+                CoverArt(
+                    coverUrl = album.coverUrl,
+                    modifier = Modifier.fillMaxSize(),
+                    cornerRadius = coverRadiusOf(c)
+                )
+            }
+        }
+        Spacer(Modifier.height(8.wdp))
+        Text(
+            album.name,
+            color = c.t1,
+            fontSize = 13.wsp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        if (album.artist.isNotBlank()) {
+            Spacer(Modifier.height(2.wdp))
+            Text(
+                album.artist,
+                color = c.t3,
+                fontSize = 11.wsp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
     }
 }

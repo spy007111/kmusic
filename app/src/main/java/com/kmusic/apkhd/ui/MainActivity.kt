@@ -750,7 +750,12 @@ fun MoyinRoot() {
                                     vm.loadDailyMix()
                                     route = Route.DailyRecommend
                                 },
-                                onMyPlaylistsClick = { route = Route.MyPlaylists }
+                                onMyPlaylistsClick = { route = Route.MyPlaylists },
+                                onNdAlbumClick = { a ->
+                                    vm.openAlbum(a.id, a.name)
+                                    route = Route.NdAlbum(a.id, a.name)
+                                },
+                                onNdSeeAll = { route = Route.NavidromeAlbums }
                             )
                             1 -> {
                                 vm.loadHotKeywords()
@@ -1164,7 +1169,9 @@ private fun HomeContent(
     onRecentClick: () -> Unit,
     onOpenRecentList: () -> Unit,
     onDailyClick: () -> Unit,
-    onMyPlaylistsClick: () -> Unit = {}
+    onMyPlaylistsClick: () -> Unit = {},
+    onNdAlbumClick: (com.kmusic.apkhd.net.AlbumInfo) -> Unit = {},
+    onNdSeeAll: () -> Unit = {}
 ) {
     // 四个入口：今日推荐 / 我喜欢的音乐 / 本地音乐 / 收藏的歌单。
     // WebDAV 仍留在媒体库（它是「来源」，不是每天要点的东西）。
@@ -1204,6 +1211,9 @@ private fun HomeContent(
         isPlaylistFavorite = isPlaylistFavorite,
         onTogglePlaylistFavorite = onTogglePlaylistFavorite,
         onArtistClick = onArtistClick,
+        ndAlbums = if (vm.navidromeConnected) vm.navidromeAlbums else emptyList(),
+        onNdAlbumClick = onNdAlbumClick,
+        onNdSeeAll = onNdSeeAll,
         onRefreshPlaylists = { vm.refreshPlaylists() },
         onRefreshArtists = { vm.refreshArtists() },
         playlistsRefreshing = vm.playlistsRefreshing,

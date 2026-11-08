@@ -1,5 +1,10 @@
 # 更新日志
 
+## 2.6.1（vc83）
+
+- 修：Navidrome 连接成功后曲目数一直显示 0（读的是 `searchResult3.total`，这个字段并不存在，改用 `getScanStatus.count`，取不到时按专辑 songCount 求和兜底）。
+- 新：首页新增「Navidrome 曲库」横滑板块，展示曲库最新专辑，点开即专辑详情，右上「查看全部」进完整专辑列表。未连接时不显示该板块。
+
 ## 2.6.0（vc82）
 
 **Navidrome 曲库（Subsonic 协议）**
