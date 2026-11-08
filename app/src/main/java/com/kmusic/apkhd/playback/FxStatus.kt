@@ -33,6 +33,8 @@ sealed interface FxStatus {
         enum class Reason {
             /** 省电播放：PCM 直通 DSP */
             OFFLOAD,
+            /** 纯净 PCM 没有挂 EQ，不伪装成硬件省电。 */
+            PURE_PCM,
             /** DSD 解码占满 CPU，自动旁路 */
             DSD,
             /** 三项全关（不该走到这里，兜底用） */
@@ -69,9 +71,10 @@ sealed interface FxStatus {
             sampleRateHz: Int? = null,
             headroomDb: Float = 0f,
             loudnessAppliedDb: Float = 0f,
-            loudnessRequestedDb: Float = 0f
+            loudnessRequestedDb: Float = 0f,
+            pureAudioMode: Boolean = false
         ): FxStatus = when {
-            // 省电播放优先：这时 PCM 根本不过本进程，说「已旁路」比说「关闭」准确
+            pureAudioMode -> Bypassed(Bypassed.Reason.PURE_PCM)
             offload -> Bypassed(Bypassed.Reason.OFFLOAD)
             dsdPlaying && dsdBypassEq -> Bypassed(Bypassed.Reason.DSD)
             wanted == 0 -> Idle

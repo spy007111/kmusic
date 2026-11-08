@@ -32,8 +32,9 @@ import kotlin.math.sin
  *
  * 88.2 kHz 目标就少一级 ÷2。
  *
- * ## 实测（对齐 ffmpeg 参考）
+ * ## 历史实测（修正末级 FIR 前，对齐 ffmpeg 参考）
  *
+ * 以下数值不代表修正后频响；修正后的完整链仍需真机与参考解码器复测。
  * 用 `dsd{64,128,256}_1k.dsf`（1 kHz 正弦）跑完整链：
  *
  * | 档位 | 1 kHz 幅度 | 2 kHz 噪声底 | 20 kHz | 21 kHz |
@@ -75,8 +76,10 @@ object DsdDecimator {
      * 其余同奇偶项之和 = 0.5。
      */
     private val HALF_BAND: FloatArray = buildHalfBand(23)
+    /** 仅 88.2→44.1k 级加长：20k 损失约0.12dB，25k 起阻带约50dB。 */
+    private val AUDIO_HALF_BAND: FloatArray = buildHalfBand(63)
 
-    private fun buildHalfBand(n: Int): FloatArray {
+    internal fun buildHalfBand(n: Int): FloatArray {
         val m = n / 2
         val h = FloatArray(n)
         for (k in 0 until n) {
@@ -110,7 +113,8 @@ object DsdDecimator {
     /**
      * 末级低通抽头（63 抽头 Hamming），DC 增益归一为 1。
      */
-    private fun buildFir(n: Int, fc: Float, fs: Float): FloatArray {
+    internal fun buildFir(n: Int, fc: Float, fs: Float): FloatArray {
+        require(n >= 3 && n % 2 == 1 && fc > 0f && fc < fs * 0.5f)
         val m = (n - 1) / 2
         val h = FloatArray(n)
         for (k in 0 until n) {
@@ -119,7 +123,7 @@ object DsdDecimator {
                 2f * fc / fs
             } else {
                 val x = 2.0 * fc * d / fs
-                (sin(Math.PI * x) / (Math.PI * x)).toFloat()
+                (2.0 * fc / fs * sin(Math.PI * x) / (Math.PI * x)).toFloat()
             }
             val w = (0.54 - 0.46 * cos(2.0 * Math.PI * k / (n - 1))).toFloat()
             h[k] = ideal * w
@@ -263,7 +267,9 @@ object DsdDecimator {
         /** ÷2 级数：MID_RATE → outRate */
         private val stageCount: Int = log2(MID_RATE / outRate)
 
-        private val stages: List<HalfBandStage> = List(stageCount) { HalfBandStage(HALF_BAND) }
+        private val stages: List<HalfBandStage> = List(stageCount) { index ->
+            HalfBandStage(if (outRate == 44100 && index == stageCount - 1) AUDIO_HALF_BAND else HALF_BAND)
+        }
 
         /**
          * 末级低通（截止 = 输出奈奎斯特的 95%，且不超过 21 kHz）。

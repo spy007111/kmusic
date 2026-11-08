@@ -41,6 +41,8 @@ data class KuwoLinkData(
     @SerialName("ekey") val ekey: String? = null,
     val duration: Int = 0,
     val format: String? = null,
+    /** 整首字节数。母带才有（20900 这档的 bitrate 是代号，不能当 kbps 用） */
+    val size: String? = null,
     @SerialName("br") val br: String? = null
 )
 

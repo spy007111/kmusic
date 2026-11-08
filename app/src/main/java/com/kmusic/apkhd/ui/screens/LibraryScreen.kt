@@ -33,6 +33,7 @@ import com.kmusic.apkhd.ui.theme.ambientGlow
 import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /**
  * 媒体库页 —— 本地音乐 + 下载管理。
@@ -155,6 +156,7 @@ private fun LibraryEntry(
     Row(
         modifier = modifier
             .fillMaxWidth()
+            .tvFocus(fullWidth = true)
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }

@@ -27,7 +27,7 @@ object SourceCatalog {
         SourceDef(LOCAL, "本地音乐", "手机内的音频文件"),
         SourceDef(NAVIDROME, "Navidrome", "自建曲库 · Subsonic 协议"),
         SourceDef(KUWO, "酷我", "母带 / 无损 / 320k"),
-        SourceDef(NETEASE, "网易云", "经 GD 中转 · 失败回退酷我"),
+        SourceDef(NETEASE, "网易云", "GD 无损通道 · 失败回退酷我"),
         SourceDef(MIGU, "咪咕", "官方接口 · 免登录 128k")
     )
 

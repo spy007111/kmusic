@@ -24,6 +24,7 @@ import com.kmusic.apkhd.ui.icons.IconDownload
 import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /** 下载管理：列出任务与进度，可移除记录 */
 @Composable
@@ -48,6 +49,7 @@ fun DownloadScreen(
                 size = 40.wdp,
                 modifier = Modifier
                     .clip(RoundedCornerShape(99.dp))
+                    .tvFocus(shape = RoundedCornerShape(99.dp))
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -118,6 +120,7 @@ fun DownloadScreen(
                                 Modifier
                                     .size(36.wdp)
                                     .clip(RoundedCornerShape(99.dp))
+                                    .tvFocus(shape = RoundedCornerShape(99.dp))
                                     .clickable(
                                         indication = null,
                                         interactionSource = remember { MutableInteractionSource() }

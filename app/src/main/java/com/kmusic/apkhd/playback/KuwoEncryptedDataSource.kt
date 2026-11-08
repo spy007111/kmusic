@@ -23,12 +23,14 @@ import java.io.IOException
  * 断点续传天然支持：decryptRange 按文件绝对偏移计算密钥流。
  */
 @UnstableApi
-class KuwoEncryptedDataSource(private val context: android.content.Context?) : BaseDataSource(true) {
+class KuwoEncryptedDataSource(private val context: android.content.Context?,
+                              private val connectTimeoutMs: Int = 15_000,
+                              private val readTimeoutMs: Int = 60_000) : BaseDataSource(true) {
 
     private val httpFactory = DefaultHttpDataSource.Factory()
         .setUserAgent("okhttp/4.10.0")
-        .setConnectTimeoutMs(15_000)
-        .setReadTimeoutMs(60_000)
+        .setConnectTimeoutMs(connectTimeoutMs)
+        .setReadTimeoutMs(readTimeoutMs)
         .setAllowCrossProtocolRedirects(true)
 
     private var upstream: DataSource? = null
@@ -42,8 +44,10 @@ class KuwoEncryptedDataSource(private val context: android.content.Context?) : B
     /** 本次 open 的曲目对应的解密器 */
     private var cipher: QmcV2Rc4? = null
 
-    class Factory(private val context: android.content.Context? = null) : DataSource.Factory {
-        override fun createDataSource(): DataSource = KuwoEncryptedDataSource(context)
+    class Factory(private val context: android.content.Context? = null,
+                  private val connectTimeoutMs: Int = 15_000,
+                  private val readTimeoutMs: Int = 60_000) : DataSource.Factory {
+        override fun createDataSource(): DataSource = KuwoEncryptedDataSource(context, connectTimeoutMs, readTimeoutMs)
     }
 
     override fun open(dataSpec: DataSpec): Long {
@@ -80,8 +84,8 @@ class KuwoEncryptedDataSource(private val context: android.content.Context?) : B
                 if (DavAuth.applies(url)) {
                     DefaultHttpDataSource.Factory()
                         .setUserAgent("okhttp/4.10.0")
-                        .setConnectTimeoutMs(15_000)
-                        .setReadTimeoutMs(60_000)
+                        .setConnectTimeoutMs(connectTimeoutMs)
+                        .setReadTimeoutMs(readTimeoutMs)
                         .setAllowCrossProtocolRedirects(true)
                         .setDefaultRequestProperties(mapOf("Authorization" to DavAuth.header!!))
                         .createDataSource()

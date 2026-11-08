@@ -118,15 +118,15 @@ class AudioMathTest {
 
     @Test
     fun clamp_respectsPeakHeadroom() {
-        // 峰值 0.9 → 只剩约 0.74dB 余量，不能给 +6dB
+        // 即使峰值留有余量，Media3 volume 归一也不允许正增益
         val g = LoudnessNormalizer.clampGain(6f, 0.9f)
-        assertTrue("应被峰值压到 ~0.7dB 以内，实际 $g", g < 1.0f)
+        assertEquals(0f, g, 0.001f)
     }
 
     @Test
-    fun clamp_limitsMaxBoost() {
-        // 峰值很低（0.1）时理论可加 20dB，但上限是 +6
-        assertEquals(6f, LoudnessNormalizer.clampGain(20f, 0.1f), 0.01f)
+    fun clamp_neverBoostsEvenWithHeadroom() {
+        // 峰值很低也不能声称 Media3.volume 可施加正增益
+        assertEquals(0f, LoudnessNormalizer.clampGain(20f, 0.1f), 0.01f)
     }
 
     @Test
@@ -138,6 +138,6 @@ class AudioMathTest {
     fun linearConversion() {
         assertEquals(1f, LoudnessNormalizer.toLinear(0f), 0.001f)
         assertEquals(0.5f, LoudnessNormalizer.toLinear(-6.02f), 0.002f)
-        assertEquals(2f, LoudnessNormalizer.toLinear(6.02f), 0.01f)
+        assertEquals(1f, LoudnessNormalizer.toLinear(6.02f), 0.01f)
     }
 }

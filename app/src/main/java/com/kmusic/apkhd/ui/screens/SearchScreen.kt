@@ -55,6 +55,7 @@ import com.kmusic.apkhd.model.SearchTab
 import com.kmusic.apkhd.ui.icons.IconClose
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /**
  * 搜索页 —— 与设计稿一致：输入框带光标、类型 chip、结果行右侧母带标签。
@@ -176,6 +177,7 @@ fun SearchScreen(
                         Modifier
                             .clip(RoundedCornerShape((c.radiusCard - 6.wdp).coerceAtLeast(2.wdp)))
                             .background(if (aiRewriting) c.accentDim else c.s3)
+                            .tvFocus(shape = RoundedCornerShape((c.radiusCard - 6.wdp).coerceAtLeast(2.wdp)))
                             .clickable(
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() }
@@ -228,6 +230,7 @@ fun SearchScreen(
                     modifier = Modifier
                         .clip(RoundedCornerShape(99.dp))
                         .background(if (on) c.accentDim else c.s2)
+                        .tvFocus(shape = RoundedCornerShape(99.dp))
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -378,6 +381,7 @@ private fun SearchHistoryPane(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(99.dp))
                                 .background(c.s2)
+                                .tvFocus(shape = RoundedCornerShape(99.dp))
                                 .clickable(
                                     indication = null,
                                     interactionSource = remember { MutableInteractionSource() }
@@ -401,6 +405,7 @@ private fun SearchHistoryPane(
                         fontSize = 12.wsp,
                         modifier = Modifier
                             .clip(RoundedCornerShape(99.dp))
+                            .tvFocus(shape = RoundedCornerShape(99.dp))
                             .clickable(
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() }
@@ -414,6 +419,7 @@ private fun SearchHistoryPane(
                 Row(
                     Modifier
                         .fillMaxWidth()
+                        .tvFocus(fullWidth = true)
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -435,6 +441,7 @@ private fun SearchHistoryPane(
                     Box(
                         Modifier
                             .size(32.wdp)
+                            .tvFocus()
                             .clickable(
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() }
@@ -461,6 +468,7 @@ private fun SuggestionList(suggestions: List<String>, onClick: (String) -> Unit)
             Row(
                 Modifier
                     .fillMaxWidth()
+                    .tvFocus(fullWidth = true)
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -495,6 +503,7 @@ private fun BriefRow(
     Row(
         Modifier
             .fillMaxWidth()
+            .tvFocus(fullWidth = true)
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -594,6 +603,7 @@ private fun SearchResultRow(
                 Modifier
                     .size(40.wdp)
                     .clip(RoundedCornerShape(99.dp))
+                    .tvFocus(shape = RoundedCornerShape(99.dp))
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -611,6 +621,7 @@ private fun SearchResultRow(
             Modifier
                 .size(40.wdp)
                 .clip(RoundedCornerShape(99.dp))
+                .tvFocus(shape = RoundedCornerShape(99.dp))
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() }
@@ -636,6 +647,7 @@ private fun TrackActionSheet(
         Modifier
             .fillMaxSize()
             .background(Color(0x99000000))
+            .tvFocus()
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -647,6 +659,7 @@ private fun TrackActionSheet(
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(topStart = 18.wdp, topEnd = 18.wdp))
                 .background(if (c.isDark) c.s1 else Color(0xFFFFFFFF))
+                .tvFocus(shape = RoundedCornerShape(topStart = 18.wdp, topEnd = 18.wdp))
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() }
@@ -692,6 +705,7 @@ private fun ActionRow(
     Row(
         Modifier
             .fillMaxWidth()
+            .tvFocus(fullWidth = true)
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }

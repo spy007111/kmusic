@@ -2,6 +2,7 @@ package com.kmusic.apkhd.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusGroup
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -35,6 +36,10 @@ import androidx.compose.material3.Text
 import androidx.compose.foundation.shape.RoundedCornerShape
 import com.kmusic.apkhd.ui.icons.IconDownload
 import com.kmusic.apkhd.ui.icons.IconClose
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
+import com.kmusic.apkhd.ui.tv.rememberTvPanelFocus
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /**
  * 曲目列表页 —— 本地音乐 / 最近播放 / Navidrome 分类共用。
@@ -78,15 +83,19 @@ fun TrackListScreen(
             .background(c.bg)
     ) {
         // 顶部返回栏
+        // TV：整条顶栏作为一个焦点组，列表往上走时能稳定落到「返回 / ⋯」这两个按钮上，
+        // 否则几何搜索可能直接跳到屏幕外的其它可聚焦元素
         Row(
             Modifier
                 .fillMaxWidth()
+                .focusGroup()
                 .padding(horizontal = 8.wdp, vertical = 8.wdp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
                 Modifier
                     .size(44.wdp)
+                    .tvFocus()
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -116,6 +125,7 @@ fun TrackListScreen(
                     Modifier
                         .size(44.wdp)
                         .clip(RoundedCornerShape(12.wdp))
+                        .tvFocus(shape = RoundedCornerShape(12.wdp))
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -145,6 +155,7 @@ fun TrackListScreen(
                         Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 16.wdp)
+                            .tvFocus()
                             .clickable(
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() }
@@ -190,6 +201,7 @@ fun TrackListScreen(
                                 Modifier
                                     .size(40.wdp)
                                     .clip(RoundedCornerShape(12.wdp))
+                                    .tvFocus(shape = RoundedCornerShape(12.wdp))
                                     .clickable(
                                         indication = null,
                                         interactionSource = remember { MutableInteractionSource() }
@@ -206,6 +218,7 @@ fun TrackListScreen(
                                 Modifier
                                     .size(40.wdp)
                                     .clip(RoundedCornerShape(12.wdp))
+                                    .tvFocus(shape = RoundedCornerShape(12.wdp))
                                     .clickable(
                                         indication = null,
                                         interactionSource = remember { MutableInteractionSource() }
@@ -226,6 +239,7 @@ fun TrackListScreen(
                                 Modifier
                                     .size(40.wdp)
                                     .clip(RoundedCornerShape(12.wdp))
+                                    .tvFocus(shape = RoundedCornerShape(12.wdp))
                                     .clickable(
                                         indication = null,
                                         interactionSource = remember { MutableInteractionSource() }
@@ -270,6 +284,8 @@ fun TrackListScreen(
     }
 
     if (showActions) {
+        // BACK 关闭面板（TV 遥控器上返回键是最顺手的退出方式）
+        androidx.activity.compose.BackHandler(enabled = true) { showActions = false }
         ActionSheet(actions = actions, onDismiss = { showActions = false })
     }
     }
@@ -286,14 +302,24 @@ data class ListAction(
  * 底部升起的操作面板。
  * 用自绘 overlay 而不是 ModalBottomSheet —— 现网多个 Material3 版本的
  * ModalBottomSheet 在这个 Compose 版本上行为不一致，自绘最稳。
+ *
+ * ⚠️ v2.4.1：面板打开时必须**把焦点抢进来**（[rememberTvPanelFocus]）。
+ * 以前打开后焦点还留在顶栏那个「⋯」上，遥控器上下动的是背后那张列表，
+ * 所以「播放全部 / 下载全部 / 收藏歌单」看得见、选不中。
+ *
+ * 同时遮罩和面板容器都 `canFocus = false`：它们是两个满屏的 `clickable` 空壳，
+ * 留着会跟真实菜单项抢焦点（按一次方向键可能落在空壳上，看起来就是"卡住不动"）。
  */
 @Composable
 private fun ActionSheet(actions: List<ListAction>, onDismiss: () -> Unit) {
     val c = moyinColors()
+    val firstFocus = rememberTvPanelFocus()
     Box(
         Modifier
             .fillMaxSize()
             .background(Color.Black.copy(alpha = 0.45f))
+            // 遮罩只负责点击关闭，不参与焦点
+            .focusProperties { canFocus = false }
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -305,7 +331,8 @@ private fun ActionSheet(actions: List<ListAction>, onDismiss: () -> Unit) {
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(topStart = 18.wdp, topEnd = 18.wdp))
                 .background(c.s1)
-                // 吃掉点击，不要穿透到遮罩上导致直接关掉
+                // 容器只负责吃掉点击（不要穿透到遮罩上导致直接关掉），不参与焦点
+                .focusProperties { canFocus = false }
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() }
@@ -313,11 +340,13 @@ private fun ActionSheet(actions: List<ListAction>, onDismiss: () -> Unit) {
                 .sheetBottomPadding()
                 .padding(vertical = 10.wdp, horizontal = 8.wdp)
         ) {
-            actions.forEach { a ->
+            actions.forEachIndexed { i, a ->
                 Row(
                     Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.wdp))
+                        .then(if (i == 0) Modifier.focusRequester(firstFocus) else Modifier)
+                        .tvFocus(shape = RoundedCornerShape(12.wdp))
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }

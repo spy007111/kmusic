@@ -48,6 +48,7 @@ import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.sheetBottomPadding
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /**
  * 新建歌单。
@@ -70,6 +71,7 @@ fun NewPlaylistDialog(
         Modifier
             .fillMaxSize()
             .background(Color(0x99000000))
+            .tvFocus()
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -82,6 +84,7 @@ fun NewPlaylistDialog(
                 .padding(horizontal = 36.wdp)
                 .clip(RoundedCornerShape(16.dp))
                 .background(if (c.isDark) c.s1 else Color(0xFFFFFFFF))
+                .tvFocus(shape = RoundedCornerShape(16.dp))
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() }
@@ -130,6 +133,7 @@ fun NewPlaylistDialog(
                     fontSize = 14.wsp,
                     modifier = Modifier
                         .clip(RoundedCornerShape(99.dp))
+                        .tvFocus(shape = RoundedCornerShape(99.dp))
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -145,6 +149,7 @@ fun NewPlaylistDialog(
                     fontWeight = FontWeight.Medium,
                     modifier = Modifier
                         .clip(RoundedCornerShape(99.dp))
+                        .tvFocus(shape = RoundedCornerShape(99.dp))
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -174,6 +179,7 @@ fun AddToPlaylistSheet(
         Modifier
             .fillMaxSize()
             .background(Color(0x99000000))
+            .tvFocus()
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -185,6 +191,7 @@ fun AddToPlaylistSheet(
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(topStart = 18.wdp, topEnd = 18.wdp))
                 .background(if (c.isDark) c.s1 else Color(0xFFFFFFFF))
+                .tvFocus(shape = RoundedCornerShape(topStart = 18.wdp, topEnd = 18.wdp))
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() }
@@ -208,6 +215,7 @@ fun AddToPlaylistSheet(
                 Box(
                     Modifier
                         .size(32.wdp)
+                        .tvFocus()
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -253,6 +261,7 @@ private fun SheetRow(
     Row(
         Modifier
             .fillMaxWidth()
+            .tvFocus(fullWidth = true)
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }

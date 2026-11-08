@@ -41,6 +41,7 @@ import com.kmusic.apkhd.model.PlaylistBrief
 import com.kmusic.apkhd.model.ArtistBrief
 import com.kmusic.apkhd.model.QuickEntry
 import com.kmusic.apkhd.ui.components.MiniPlayerBar
+import androidx.compose.ui.focus.focusProperties
 import com.kmusic.apkhd.ui.components.MoyinSideRail
 import com.kmusic.apkhd.ui.components.MoyinTabBar
 import com.kmusic.apkhd.ui.components.TabItem
@@ -83,13 +84,67 @@ import com.kmusic.apkhd.ui.screens.ListAction
 import com.kmusic.apkhd.model.AlbumBrief
 import com.kmusic.apkhd.model.Track
 import com.kmusic.apkhd.ui.icons.IconClose
+import com.kmusic.apkhd.ui.tv.LocalIsTv
 
 @OptIn(UnstableApi::class)
 class MainActivity : ComponentActivity() {
+    var permissionExistingUser: Boolean = false
+        private set
+    private val exitHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var activityVisible = false
+    private var externalUiAtMs: Long? = null
+    private var userLeaving = false
+    private val tvBackgroundCheck = Runnable { stopTvIfBackground() }
+
+    fun beginExternalUi() { externalUiAtMs = android.os.SystemClock.elapsedRealtime() }
+    fun finishExternalUi() { externalUiAtMs = null; exitHandler.removeCallbacks(tvBackgroundCheck); stopTvIfBackground() }
+    override fun onStart() {
+        super.onStart()
+        activityVisible = true
+        userLeaving = false
+        exitHandler.removeCallbacks(tvBackgroundCheck)
+        if (com.kmusic.apkhd.ui.tv.TvEnv.isTv(this)) com.kmusic.apkhd.playback.PlaybackSessionExit.openSession()
+    }
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (externalUiAtMs == null) userLeaving = true
+    }
+    override fun onStop() {
+        activityVisible = false
+        super.onStop()
+        stopTvIfBackground()
+    }
+    private fun stopTvIfBackground() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (com.kmusic.apkhd.playback.PlaybackBackgroundPolicy.resolve(
+                com.kmusic.apkhd.ui.tv.TvEnv.isTv(this), activityVisible, isChangingConfigurations, isFinishing,
+                externalUiAtMs != null, externalUiAtMs, now, userLeaving)) {
+            com.kmusic.apkhd.playback.PlaybackSessionExit.requestStop(this)
+        } else if (!activityVisible && !isChangingConfigurations) {
+            val delay = com.kmusic.apkhd.playback.PlaybackBackgroundPolicy.permissionRecheckDelayMs(externalUiAtMs != null, externalUiAtMs, now)
+            if (delay > 0) { exitHandler.removeCallbacks(tvBackgroundCheck); exitHandler.postDelayed(tvBackgroundCheck, delay) }
+        }
+    }
+    override fun onDestroy() { exitHandler.removeCallbacksAndMessages(null); super.onDestroy() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Capture before the ViewModel can write normal settings on a fresh installation.
+        permissionExistingUser = savedInstanceState?.getBoolean("permission_existing_user") ?: listOf(
+            "datastore/moyin_settings.preferences_pb", "datastore/playback_queue.preferences_pb", "datastore/playback_position.preferences_pb"
+        ).any { java.io.File(filesDir, it).let { file -> file.exists() && file.length() > 0 } }
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent { MoyinRoot() }
+    }
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("permission_existing_user", permissionExistingUser)
+        super.onSaveInstanceState(outState)
+    }
+    override fun onResume() {
+        super.onResume()
+        externalUiAtMs = null
+        if (com.kmusic.apkhd.ui.tv.TvEnv.isTv(this)) androidx.lifecycle.ViewModelProvider(this)[MoyinViewModel::class.java].onUiForeground()
+        com.kmusic.apkhd.playback.CallStateMonitor.requestRefresh()
     }
 }
 
@@ -155,7 +210,11 @@ fun MoyinRoot() {
             accentAlpha = accentAlpha,
             darkStyle = darkStyleName
         ) {
+          // TV 判定放在最外层：手机 / 车机 false，下面所有 tvFocus / tvClickable
+          // 都退化成改造前的行为，渲染路径不变
+          val tvMode = com.kmusic.apkhd.ui.tv.TvEnv.isTv(androidx.compose.ui.platform.LocalContext.current)
           CompositionLocalProvider(
+              LocalIsTv provides tvMode,
               LocalSafeBottom provides safeBottom,
               LocalFrostLevel provides frostLevel
           ) {
@@ -171,6 +230,8 @@ fun MoyinRoot() {
             var showWrongLyric by remember { mutableStateOf(false) }
             // 首页双击返回退出：第一次只提示，不 finish。防止误触回桌面
             var backHintAt by remember { mutableStateOf(0L) }
+            val tvExitConfirmation = remember { com.kmusic.apkhd.playback.TvExitConfirmation() }
+            LaunchedEffect(tab, route, showPlayer, showWrongLyric) { tvExitConfirmation.reset() }
 
             // BackHandler 的排查 Toast 要用，必须声明在 BackHandler 之前
             val ctx = androidx.compose.ui.platform.LocalContext.current
@@ -206,7 +267,12 @@ fun MoyinRoot() {
                     // 首页：2s 内第二次按才放行；第一次弹提示
                     tab == 0 -> {
                         val now = android.os.SystemClock.elapsedRealtime()
-                        if (now - backHintAt < 2000L) {
+                        if (tvMode) {
+                            if (tvExitConfirmation.back(true, false, true, now) == com.kmusic.apkhd.playback.TvExitConfirmation.Action.EXIT) {
+                                vm.exitTvPlayback()
+                                activity?.finishAndRemoveTask()
+                            } else android.widget.Toast.makeText(ctx, "再按一次返回退出", android.widget.Toast.LENGTH_SHORT).show()
+                        } else if (now - backHintAt < 2000L) {
                             backHintAt = 0L
                             activity?.finish()
                         } else {
@@ -223,44 +289,50 @@ fun MoyinRoot() {
             // 主题变更写回存储
             LaunchedEffect(themeMode) { }
 
-            // 运行时权限：本地音频读取（Manifest 声明不够，必须动态申请）
-            //
-            // ⚠️ **拒绝也要继续扫**（v2.2.4 修）：这个权限只管 MediaStore，
-            // 用户在「扫描设置」里手动加的 SAF 目录并不需要它。
-            // 旧代码 `if (granted) vm.scanLocal()` 让「拒绝授权」变成
-            // 「一首都不扫」，UI 显示 0 首且没有任何提示 —— 和曲库真空没区别。
-            // 现在无论如何都扫一次：扫不到 MediaStore 时 VM 会打日志说明原因。
-            val permLauncher = rememberLauncherForActivityResult(
-                ActivityResultContracts.RequestPermission()
-            ) { vm.scanLocal() }
-
-            // 通知权限：Android 13+ 没有它就没有媒体通知（锁屏/媒体卡片会空）
-            val notifLauncher = rememberLauncherForActivityResult(
-                ActivityResultContracts.RequestPermission()
-            ) { }
-
-            LaunchedEffect(Unit) {
-                if (android.os.Build.VERSION.SDK_INT >= 33) {
-                    notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                }
-                // ⚠️ 没权限也要调 scanLocal()：它现在会跳过 MediaStore 但仍扫 SAF 目录。
-                // 有权限时直接扫；没权限时先扫一遍（SAF 的歌马上就出来），
-                // 弹窗结果回来后再扫一次（这次 MediaStore 也有了）。
-                vm.scanLocal()
-                if (!vm.hasAudioPermission()) permLauncher.launch(audioPermission())
+            var pendingDeviceBinding by remember { mutableStateOf<String?>(null) }
+            var pendingDeviceSave by remember { mutableStateOf<String?>(null) }
+            val devicePermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+                (activity as? MainActivity)?.finishExternalUi()
+                vm.refreshDeviceIdentity()
+                pendingDeviceBinding?.let(vm::bindDeviceProfile)
+                pendingDeviceSave?.let { name -> vm.saveDeviceProfile(name, true) }
+                pendingDeviceBinding = null
+                pendingDeviceSave = null
             }
+            val needsDevicePermission = {
+                vm.audioRuntime.route?.isBluetooth == true && Build.VERSION.SDK_INT >= 31 &&
+                    androidx.core.content.ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_CONNECT) != android.content.pm.PackageManager.PERMISSION_GRANTED
+            }
+            val bindDeviceProfile: (String) -> Unit = { id ->
+                if (needsDevicePermission()) {
+                    pendingDeviceBinding = id
+                    (activity as? MainActivity)?.beginExternalUi()
+                    devicePermLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+                } else vm.bindDeviceProfile(id)
+            }
+            val saveSoundScheme: (String, Boolean) -> Unit = { name, bind ->
+                if (bind && needsDevicePermission()) {
+                    pendingDeviceSave = name
+                    (activity as? MainActivity)?.beginExternalUi()
+                    devicePermLauncher.launch(Manifest.permission.BLUETOOTH_CONNECT)
+                } else vm.saveDeviceProfile(name, bind)
+            }
+            PermissionOnboarding(context = ctx, existingUser = (activity as? MainActivity)?.permissionExistingUser ?: true,
+                isTv = tvMode, beforeRequest = { (activity as? MainActivity)?.beginExternalUi() },
+                afterRequest = { (activity as? MainActivity)?.finishExternalUi() }, onAudioResult = vm::scanLocal)
+            LaunchedEffect(Unit) { vm.scanLocal() }
 
             // 系统目录选择器：用户手动指定要扫描的目录（MediaStore 看不见的也能扫）
             val safTreeLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
                 androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree()
-            ) { uri -> if (uri != null) vm.addSafFolder(uri) }
+            ) { uri -> (activity as? MainActivity)?.finishExternalUi(); if (uri != null) vm.addSafFolder(uri) }
 
             // 一次性提示（下载加入、连接失败…）—— VM 发，这里弹一次就消费掉
             // ctx 已在上面声明（BackHandler 的排查 Toast 共用）
             val userMsg = vm.userMessage
             LaunchedEffect(userMsg) {
                 if (userMsg != null) {
-                    android.widget.Toast.makeText(ctx, userMsg.text, android.widget.Toast.LENGTH_SHORT).show()
+                    android.widget.Toast.makeText(ctx, userMsg.text, if (userMsg.long) android.widget.Toast.LENGTH_LONG else android.widget.Toast.LENGTH_SHORT).show()
                     vm.consumeUserMessage()
                 }
             }
@@ -303,6 +375,10 @@ fun MoyinRoot() {
                             .fillMaxHeight()
                             .statusBarsPadding()
                             .navigationBarsPadding()
+                            // 播放页是覆盖层，但侧栏仍在同一棵焦点树里，焦点搜索会
+                            // 穿到遮罩背后拿到它 —— 用户看到的就是「进了播放页，
+                            // 方向键动的却是看不见的侧栏」。播放页打开时让出焦点。
+                            .focusProperties { if (showPlayer) canFocus = false }
                     )
                 }
 
@@ -315,13 +391,29 @@ fun MoyinRoot() {
                         )
                         .statusBarsPadding()
                         .navigationBarsPadding()
+                        // 同上：播放页打开时整块主内容退出焦点树，
+                        // 否则焦点会从播放页跑到背后看不见的列表/卡片上。
+                        .focusProperties { if (showPlayer) canFocus = false }
                 ) {
                     // 子页面优先于 Tab
                     // 页面切换淡入淡出 —— 硬切太生硬。Route 全是 data object/class，
                     // 结构相等性稳定，不会因为重组误触发。
+                    // TV：底部迷你播放条是**悬浮覆盖**在内容之上的。
+                    // Compose 的 bringIntoView 只认「滚动容器视口」，不知道上面还压了一条，
+                    // 于是列表最后一行拿到焦点时刚好滑到视口底边＝被播放条盖住
+                    // （遥控没法像手指那样再往上推一把，就是看不见自己选中了什么）。
+                    // 解法：TV 下把页面容器底边抬到播放条之上，让视口本身变矮。
+                    // 手机/车机 tvMode=false → 0dp，布局一个像素都不动。
+                    val tvBottomReserve = if (tvMode) window.miniPlayerHeight + 12.dp else 0.dp
                     Crossfade(
                         targetState = route,
-                        animationSpec = tween(220),
+                        modifier = Modifier.padding(bottom = tvBottomReserve),
+                        // ⚠️ v2.4.2：TV 上动画时长归零。
+                        // Crossfade 期间新旧两页同时挂树，旧页在 220ms 里被销毁时
+                        // 会把焦点抢回它自己 —— 新页面里刚 requestFocus 成功的行
+                        // 一帧后就被抢走，用户看到的就是「进页面焦点丢了」。
+                        // 遥控器用户也不在意这 220ms 的淡入，直接切更利落。
+                        animationSpec = tween(if (tvMode) 0 else 220),
                         label = "route"
                     ) { r ->
                     when (r) {
@@ -359,7 +451,7 @@ fun MoyinRoot() {
                                     }
                                     vm.applyLocalFolderSelection(if (on) base + path else base - path)
                                 },
-                                onAddFolder = { safTreeLauncher.launch(null) },
+                                onAddFolder = { run { (activity as? MainActivity)?.beginExternalUi(); safTreeLauncher.launch(null) } },
                                 onRemoveFolder = vm::removeSafFolder,
                                 onRescan = { vm.rescanLocal(); vm.loadLocalFolders() },
                                 onBack = { route = Route.LocalTracks }
@@ -736,6 +828,26 @@ fun MoyinRoot() {
                                 onLoudnessModeChange = vm::changeLoudnessMode,
                                 audioOffload = vm.audioOffload,
                                 onAudioOffloadChange = vm::changeAudioOffload,
+                                audioOffloadStatus = vm.audioRuntime.offloadStatus,
+                                audioOutputMode = vm.audioOutputMode,
+                                onAudioOutputModeChange = vm::changeAudioOutputMode,
+                                usbModeAvailable = vm.usbModeAvailable,
+                                deviceProfileActiveId = vm.deviceProfileRuntime.active?.id,
+                                hasConfirmedAudioRoute = vm.audioRuntime.route != null,
+                                onBindDeviceProfile = bindDeviceProfile,
+                                deviceProfiles = vm.deviceProfiles,
+                                deviceProfileAuto = vm.deviceProfileAuto,
+                                deviceProfileStatus = vm.deviceProfileRuntime.active?.name ?: "全局音效 · ${vm.deviceProfileRuntime.routeLabel}",
+                                devicePreGainDb = com.kmusic.apkhd.playback.FxChain.devicePreGainDb,
+                                onDevicePreGainChange = vm::changeDevicePreGain,
+                                onDeviceProfileAutoChange = vm::changeDeviceProfileAuto,
+                                onSaveDeviceProfile = saveSoundScheme,
+                                onApplyDeviceProfile = vm::applyDeviceProfile,
+                                onDeleteDeviceProfile = vm::deleteDeviceProfile,
+                                pureAudioMode = vm.pureAudioMode,
+                                onPureAudioModeChange = vm::changePureAudioMode,
+                                bluetoothAutoResume = vm.bluetoothAutoResume,
+                                onBluetoothAutoResumeChange = vm::changeBluetoothAutoResume,
                                 dsdOutRate = vm.dsdOutRate,
                                 onDsdOutRateChange = vm::changeDsdOutRate,
                                 dsdBypassEq = vm.dsdBypassEq,
@@ -749,6 +861,8 @@ fun MoyinRoot() {
                                 },
                                 wifiOnlyDownload = vm.wifiOnlyDownload,
                                 onWifiOnlyDownloadChange = vm::changeWifiOnlyDownload,
+                                masterWifiOnly = vm.masterWifiOnly,
+                                onMasterWifiOnlyChange = vm::changeMasterWifiOnly,
                                 autoResumePlayback = vm.autoResumePlayback,
                                 onAutoResumePlaybackChange = vm::changeAutoResumePlayback,
                                 aiEndpoint = vm.aiEndpoint,
@@ -813,6 +927,7 @@ fun MoyinRoot() {
                                 coverUrl = vm.playbackState.track?.coverUrl,
                                 progress = vm.playbackState.progress,
                                 isPlaying = vm.playbackState.isPlaying,
+                                stalled = vm.playbackState.stalled,
                                 onClick = { showPlayer = true },
                                 onTogglePlay = vm::togglePlay,
                                 modifier = Modifier.padding(horizontal = 16.wdp)
@@ -839,6 +954,7 @@ fun MoyinRoot() {
                     PlayerScreen(
                         track = vm.playbackState.track,
                         isPlaying = vm.playbackState.isPlaying,
+                        stalled = vm.playbackState.stalled,
                         // 进度/位置都用 lambda 传：这两个值每 100ms 变一次，
                         // 直接传值会让整个播放页跟着轮询重组，传 lambda 则只在叶子读取处重组
                         progressProvider = { vm.playbackState.progress },
@@ -901,6 +1017,15 @@ fun MoyinRoot() {
                                 eqRange = vm.eqRange,
                                 eqCustom = vm.eqCustom,
                                 onEqBandChange = vm::changeEqBand,
+                                deviceProfiles = vm.deviceProfiles,
+                                deviceProfileActiveId = vm.deviceProfileRuntime.active?.id,
+                                hasConfirmedAudioRoute = vm.audioRuntime.route != null,
+                                onSaveDeviceProfile = saveSoundScheme,
+                                onApplyDeviceProfile = vm::applyDeviceProfile,
+                                onDeleteDeviceProfile = vm::deleteDeviceProfile,
+                                onBindDeviceProfile = bindDeviceProfile,
+                                deviceProfileAuto = vm.deviceProfileAuto,
+                                onDeviceProfileAutoChange = vm::changeDeviceProfileAuto,
                                 userEqPresets = vm.userEqPresets,
                                 onSaveEqCurve = vm::saveCurrentEqCurve,
                                 onApplyEqCurve = vm::applyEqCurve,
@@ -912,7 +1037,8 @@ fun MoyinRoot() {
                         fxWantedCount = vm.fxWantedCount,
                         fxSampleRate = vm.fxSampleRate,
                         fxHeadroomDb = vm.fxHeadroomDb,
-                        audioOffload = vm.audioOffload,
+                        audioOffload = vm.audioRuntime.offloadRequested,
+                        pureAudioMode = vm.audioRuntime.pureAudioModeRequested || vm.audioRuntime.usbHighFidelityRequested,
                         dsdPlaying = vm.dsdPlaying,
                         dsdLabel = vm.dsdLabel,
                         dsdBypassEq = vm.dsdBypassEq,
@@ -1047,6 +1173,12 @@ private fun HomeContent(
         onRefreshArtists = { vm.refreshArtists() },
         playlistsRefreshing = vm.playlistsRefreshing,
         artistsRefreshing = vm.artistsRefreshing,
+        onLoadMorePlaylists = { vm.loadMorePlaylists() },
+        onLoadMoreArtists = { vm.loadMoreArtists() },
+        playlistsLoadingMore = vm.playlistsLoadingMore,
+        artistsLoadingMore = vm.artistsLoadingMore,
+        playlistsExhausted = vm.playlistsExhausted,
+        artistsExhausted = vm.artistsExhausted,
         onSearchClick = onSearchClick,
         onEntryClick = { e ->
             when (e.title) {

@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.dp
 import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /**
  * 数值精确输入浮层（B5）。
@@ -76,6 +77,7 @@ fun NumberInputDialog(
         Modifier
             .fillMaxSize()
             .background(Color(0x99000000))
+            .tvFocus()
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -88,6 +90,7 @@ fun NumberInputDialog(
                 .padding(horizontal = 40.wdp)
                 .clip(RoundedCornerShape(16.dp))
                 .background(if (c.isDark) c.s1 else Color(0xFFFFFFFF))
+                .tvFocus(shape = RoundedCornerShape(16.dp))
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() }
@@ -144,6 +147,7 @@ fun NumberInputDialog(
                         fontSize = 13.wsp,
                         modifier = Modifier
                             .clip(RoundedCornerShape(99.dp))
+                            .tvFocus(shape = RoundedCornerShape(99.dp))
                             .clickable(
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() }
@@ -158,6 +162,7 @@ fun NumberInputDialog(
                     fontSize = 13.wsp,
                     modifier = Modifier
                         .clip(RoundedCornerShape(99.dp))
+                        .tvFocus(shape = RoundedCornerShape(99.dp))
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -173,6 +178,7 @@ fun NumberInputDialog(
                     fontWeight = FontWeight.Medium,
                     modifier = Modifier
                         .clip(RoundedCornerShape(99.dp))
+                        .tvFocus(shape = RoundedCornerShape(99.dp))
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }

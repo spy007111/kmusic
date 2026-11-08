@@ -7,6 +7,9 @@
          这是普通权限，安装即授予，不需要运行时申请。 -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Only requested by the explicit call-resume/device-binding actions. -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
@@ -16,6 +19,15 @@
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
+
+    <!-- 电视盒子 / TV 投屏盒：没有触摸屏也能装。
+         不加这条时，Play 商店与部分盒子的安装器会把「需要触摸屏」当成硬门槛。
+         手机 / 车机本来就有触摸屏，这条 required=false 对它们没有任何影响。
+         ⚠️ 不要加 <uses-feature android:name="android.hardware.touchscreen" android:required="true"/>，
+         那会把 TV 直接排除掉。 -->
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <!-- 遥控器方向键（D-pad）：声明为非必需，避免挡住只有触屏的手机 -->
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
 
     <application
         android:name=".MoyinApp"
@@ -36,6 +48,13 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- TV 桌面（leanback launcher）也要能看到这个 App。
+                 这条只是**多一个入口**，不替换上面的 LAUNCHER，
+                 所以手机 / 车机的桌面图标行为完全不变。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
         </activity>
     

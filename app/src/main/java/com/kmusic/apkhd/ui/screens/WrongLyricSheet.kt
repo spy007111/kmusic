@@ -17,6 +17,7 @@ import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.sheetBottomPadding
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /**
  * 「歌词不对？」反馈面板。
@@ -75,6 +76,7 @@ fun WrongLyricSheet(
                         .padding(bottom = 6.wdp)
                         .clip(RoundedCornerShape(12.wdp))
                         .background(c.s2)
+                        .tvFocus(shape = RoundedCornerShape(12.wdp))
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
@@ -107,6 +109,7 @@ fun WrongLyricSheet(
                     fontSize = 13.wsp,
                     modifier = Modifier
                         .clip(RoundedCornerShape(10.wdp))
+                        .tvFocus(shape = RoundedCornerShape(10.wdp))
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null

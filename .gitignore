@@ -27,3 +27,8 @@ MEMORY.md
 
 # 作者本机的签名说明（含口令），不上传
 SIGNING.md
+
+# ---- 由 _templates/gitignore.unified 追加（2026-10-30）----
+node_modules/
+.dart_tool/
+__pycache__/

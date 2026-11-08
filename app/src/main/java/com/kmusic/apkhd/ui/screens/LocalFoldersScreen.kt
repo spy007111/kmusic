@@ -29,6 +29,7 @@ import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
 import com.kmusic.apkhd.ui.theme.wspSp
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /**
  * 本地音乐「扫描设置」。
@@ -64,6 +65,7 @@ fun LocalFoldersScreen(
         ) {
             Box(
                 Modifier.size(40.wdp).clip(RoundedCornerShape(20.wdp))
+                    .tvFocus()
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null
@@ -91,6 +93,7 @@ fun LocalFoldersScreen(
                 fontSize = 13.wsp,
                 modifier = Modifier
                     .clip(RoundedCornerShape(10.wdp))
+                    .tvFocus(shape = RoundedCornerShape(10.wdp))
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null
@@ -168,6 +171,7 @@ fun LocalFoldersScreen(
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 16.wdp, vertical = 10.wdp)
                         .clip(RoundedCornerShape(14.wdp)).background(c.s2)
+                        .tvFocus(shape = RoundedCornerShape(14.wdp)).background(c.s2)
                         .clickable(
                             interactionSource = remember { MutableInteractionSource() },
                             indication = null
@@ -211,6 +215,7 @@ private fun FolderRow(
     val c = moyinColors()
     Row(
         Modifier.fillMaxWidth()
+            .tvFocus(fullWidth = true)
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null
@@ -248,6 +253,7 @@ private fun FolderRow(
         if (onRemove != null) {
             Box(
                 Modifier.size(30.wdp).clip(RoundedCornerShape(15.wdp))
+                    .tvFocus()
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null

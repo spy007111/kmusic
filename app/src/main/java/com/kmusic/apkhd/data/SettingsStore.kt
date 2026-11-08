@@ -46,6 +46,8 @@ class SettingsStore(private val context: Context) {
     private val playModeKey = stringPreferencesKey("play_mode")
     private val losslessFallbackKey = booleanPreferencesKey("lossless_fallback")
     private val wifiOnlyKey = booleanPreferencesKey("wifi_only_download")
+    /** 母带仅在 Wi-Fi 下播放（默认关：流量也照播母带，用户自己开） */
+    private val masterWifiOnlyKey = booleanPreferencesKey("master_wifi_only")
     private val lyricOffsetKey = longPreferencesKey("lyric_offset_ms")
     private val lyricFontKey = floatPreferencesKey("lyric_font_scale")
     private val eqEnabledKey = booleanPreferencesKey("eq_enabled")
@@ -60,12 +62,19 @@ class SettingsStore(private val context: Context) {
     private val loudnessModeKey = stringPreferencesKey("loudness_mode")
     /** 省电播放（offload）。开了就没有音效 */
     private val offloadKey = booleanPreferencesKey("audio_offload")
+    private val pureAudioModeKey = booleanPreferencesKey("pure_audio_mode")
+    private val usbHighFidelityKey = booleanPreferencesKey("usb_high_fidelity")
+    private val callAutoResumeKey = booleanPreferencesKey("call_auto_resume")
+    private val audioInterruptionResumeKey = booleanPreferencesKey("audio_interruption_resume")
+    private val truePeakEnabledKey = booleanPreferencesKey("true_peak_enabled")
+    private val truePeakCeilingKey = floatPreferencesKey("true_peak_ceiling_db")
     /** DSD 输出采样率：44100 / 88200 */
     private val dsdOutRateKey = intPreferencesKey("dsd_out_rate")
     /** DSD 自动旁路均衡器 */
     private val dsdBypassEqKey = booleanPreferencesKey("dsd_bypass_eq")
     /** 冷启动后自动接着播（默认关：重开停在原位等用户按播放） */
     private val autoResumeKey = booleanPreferencesKey("auto_resume_playback")
+    private val bluetoothAutoResumeKey = booleanPreferencesKey("bluetooth_auto_resume")
 
     // ── AI 导赏（OpenAI 兼容接口，key 由用户自己填）──
     private val aiEndpointKey = stringPreferencesKey("ai_endpoint")
@@ -158,6 +167,21 @@ class SettingsStore(private val context: Context) {
         context.dataStore.edit { it[wifiOnlyKey] = on }
     }
 
+    /**
+     * 母带仅在 Wi-Fi 下播放。**默认关**。
+     *
+     * 关掉＝流量也照播母带：一首 130–210MB、5.4Mbps，听十首就是一个 G。
+     * 但这是明确的产品选择 —— 用户要的是「别替我降质」，不是「替我心疼流量」。
+     * 心疼流量的自己去设置打开，打开后移动网络下自动用 GD 无损（≈35MB/首）。
+     */
+    val masterWifiOnly: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[masterWifiOnlyKey] ?: false
+    }
+
+    suspend fun setMasterWifiOnly(on: Boolean) {
+        context.dataStore.edit { it[masterWifiOnlyKey] = on }
+    }
+
     /** 歌词时间轴偏移（毫秒）。正值 = 歌词提前。对不准时手动调 */
     val lyricOffsetMs: Flow<Long> = context.dataStore.data.map { prefs ->
         prefs[lyricOffsetKey] ?: LYRIC_OFFSET_DEFAULT_MS
@@ -212,7 +236,7 @@ class SettingsStore(private val context: Context) {
         context.dataStore.edit { it[loudnessModeKey] = if (mode in setOf("off", "track", "album")) mode else "track" }
     }
 
-    /** 省电播放（offload）：把 PCM 直接交给 DSP，省电；代价是音效链全部失效 */
+    /** 请求硬件offload；设备/格式不支持时回退普通输出，软件音效仍旁路。 */
     val audioOffload: Flow<Boolean> = context.dataStore.data.map { it[offloadKey] ?: false }
 
     /**
@@ -243,7 +267,64 @@ class SettingsStore(private val context: Context) {
         context.dataStore.edit { it[dsdBypassEqKey] = on }
     }
 
-    suspend fun setAudioOffload(on: Boolean) { context.dataStore.edit { it[offloadKey] = on } }
+    suspend fun setAudioOffload(on: Boolean) {
+        context.dataStore.edit {
+            it[offloadKey] = on
+            if (on) {
+                it[pureAudioModeKey] = false
+                it[usbHighFidelityKey] = false
+            }
+        }
+    }
+
+    /** 纯净PCM：不挂软件音效，优先float；实际格式取决于解码器和设备，不代表bit-perfect。 */
+    val pureAudioMode: Flow<Boolean> = context.dataStore.data.map { it[pureAudioModeKey] ?: false }
+
+    suspend fun setPureAudioMode(on: Boolean) {
+        context.dataStore.edit {
+            it[pureAudioModeKey] = on
+            if (on) {
+                it[offloadKey] = false
+                it[usbHighFidelityKey] = false
+            }
+        }
+    }
+
+    val usbHighFidelity: Flow<Boolean> = context.dataStore.data.map { it[usbHighFidelityKey] ?: false }
+    val audioInterruptionResume: Flow<Boolean> = context.dataStore.data.map { it[audioInterruptionResumeKey] ?: true }
+    suspend fun setAudioInterruptionResume(on: Boolean) { context.dataStore.edit { it[audioInterruptionResumeKey] = on } }
+    val callAutoResume: Flow<Boolean> = context.dataStore.data.map { it[callAutoResumeKey] ?: true }
+    val truePeakEnabled: Flow<Boolean> = context.dataStore.data.map { it[truePeakEnabledKey] ?: false }
+    val truePeakCeilingDb: Flow<Float> = context.dataStore.data.map {
+        it[truePeakCeilingKey]?.takeIf(Float::isFinite)?.coerceIn(-6f, -0.5f) ?: -1f
+    }
+    val audioOutputMode: Flow<String> = context.dataStore.data.map {
+        when {
+            it[usbHighFidelityKey] == true -> "usb"
+            it[pureAudioModeKey] == true -> "pure"
+            it[offloadKey] == true -> "offload"
+            else -> "processed"
+        }
+    }
+
+    suspend fun setAudioOutputMode(mode: String) {
+        require(mode in setOf("processed", "offload", "pure", "usb"))
+        val resolved = com.kmusic.apkhd.playback.AudioModeDefaults.resolve(mode)
+        context.dataStore.edit {
+            it[offloadKey] = resolved.audioOffload
+            it[pureAudioModeKey] = resolved.pureAudioMode
+            it[usbHighFidelityKey] = resolved.usbHighFidelity
+        }
+    }
+    suspend fun setUsbHighFidelity(on: Boolean) {
+        if (on) setAudioOutputMode("usb") else context.dataStore.edit { it[usbHighFidelityKey] = false }
+    }
+    suspend fun setCallAutoResume(on: Boolean) { context.dataStore.edit { it[callAutoResumeKey] = on } }
+    suspend fun setTruePeakEnabled(on: Boolean) { context.dataStore.edit { it[truePeakEnabledKey] = on } }
+    suspend fun setTruePeakCeilingDb(value: Float) {
+        require(value.isFinite())
+        context.dataStore.edit { it[truePeakCeilingKey] = value.coerceIn(-6f, -0.5f) }
+    }
 
     /**
      * 冷启动后自动接着播。
@@ -255,6 +336,13 @@ class SettingsStore(private val context: Context) {
 
     suspend fun setAutoResumePlayback(on: Boolean) {
         context.dataStore.edit { it[autoResumeKey] = on }
+    }
+
+    /** 同设备短时蓝牙重连可选续播，仅服务存活时；默认关闭。 */
+    val bluetoothAutoResume: Flow<Boolean> = context.dataStore.data.map { it[bluetoothAutoResumeKey] ?: false }
+
+    suspend fun setBluetoothAutoResume(on: Boolean) {
+        context.dataStore.edit { it[bluetoothAutoResumeKey] = on }
     }
 
     val themeMode: Flow<ThemeMode> = context.dataStore.data.map { prefs ->

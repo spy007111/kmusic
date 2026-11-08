@@ -5,6 +5,7 @@ import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.Animatable
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.rememberInfiniteTransition
@@ -17,6 +18,7 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.focusable
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.foundation.verticalScroll
@@ -27,6 +29,8 @@ import com.kmusic.apkhd.ui.icons.IconVolume
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.*
@@ -64,6 +68,9 @@ import com.kmusic.apkhd.model.LyricLine
 import com.kmusic.apkhd.playback.FxChain
 import com.kmusic.apkhd.model.PlayMode
 import com.kmusic.apkhd.model.Track
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
+import com.kmusic.apkhd.ui.tv.LocalIsTv
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import com.kmusic.apkhd.net.GuideMarkup
@@ -77,7 +84,6 @@ import com.kmusic.apkhd.ui.components.EqCurve
 import com.kmusic.apkhd.ui.components.EqPresetGroupedChips
 import com.kmusic.apkhd.ui.components.NumberInputDialog
 import com.kmusic.apkhd.ui.components.PlayerImmersiveMode
-import com.kmusic.apkhd.ui.components.SaveCurveDialog
 import com.kmusic.apkhd.ui.components.UserCurveList
 import com.kmusic.apkhd.ui.components.playerSwipeGestures
 import com.kmusic.apkhd.ui.components.restoreBarsOnTouch
@@ -129,6 +135,24 @@ import kotlin.math.roundToInt
 import com.kmusic.apkhd.ui.icons.IconClose
 import com.kmusic.apkhd.model.UserPlaylist
 import com.kmusic.apkhd.ui.icons.IconPlaylist
+import com.kmusic.apkhd.ui.tv.tvFocus
+import com.kmusic.apkhd.ui.tv.TvDimens
+import com.kmusic.apkhd.ui.tv.isTvMode
+import com.kmusic.apkhd.ui.tv.requestFocusSafely
+import com.kmusic.apkhd.ui.tv.rememberTvPanelFocus
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.type
+import com.kmusic.apkhd.ui.tv.tvRootFocus
+import com.kmusic.apkhd.ui.tv.tvPanelGroup
+import com.kmusic.apkhd.ui.tv.tvEdgeUp
+import com.kmusic.apkhd.ui.tv.tvEdgeDown
 
 /**
  * 播放页。
@@ -141,6 +165,8 @@ import com.kmusic.apkhd.ui.icons.IconPlaylist
 fun PlayerScreen(
     track: Track?,
     isPlaying: Boolean,
+    /** 连续缓冲超过 3 秒（PlaybackState.stalled）—— 叠加加载圈，图标仍显示「暂停」 */
+    stalled: Boolean = false,
     /** 播放进度（0~1）。用 lambda 提供：进度每 100ms 变一次，只有真正读它的进度条才重组 */
     progressProvider: () -> Float,
     /** 播放位置（毫秒）。同样用 lambda：读在顶层会把封面 / 歌词 / 按钮全带着重组 */
@@ -193,6 +219,15 @@ fun PlayerScreen(
     onRefreshEq: () -> Unit = {},
     onEqBandChange: (Int, Int) -> Unit = { _, _ -> },
     /** 用户自建曲线（A3），上限 20 条 */
+    deviceProfiles: List<com.kmusic.apkhd.data.DeviceEqProfile> = emptyList(),
+    deviceProfileActiveId: String? = null,
+    hasConfirmedAudioRoute: Boolean = false,
+    onSaveDeviceProfile: (String, Boolean) -> Unit = { _, _ -> },
+    onApplyDeviceProfile: (String?) -> Unit = {},
+    onDeleteDeviceProfile: (String) -> Unit = {},
+    onBindDeviceProfile: (String) -> Unit = {},
+    deviceProfileAuto: Boolean = false,
+    onDeviceProfileAutoChange: (Boolean) -> Unit = {},
     userEqPresets: List<com.kmusic.apkhd.playback.UserEqPresets.Preset> = emptyList(),
     onSaveEqCurve: (String) -> Unit = {},
     onApplyEqCurve: (com.kmusic.apkhd.playback.UserEqPresets.Preset) -> Unit = {},
@@ -217,6 +252,7 @@ fun PlayerScreen(
     fxHeadroomDb: Float = 0f,
     /** 省电播放（offload）已开：PCM 直通 DSP，音效不可用 */
     audioOffload: Boolean = false,
+    pureAudioMode: Boolean = false,
     // 音频信息 + AI 导赏
     audioInfo: AudioInfo? = null,
     /** 响度归一当前增益（dB）；0 表示没归一 */
@@ -295,17 +331,189 @@ fun PlayerScreen(
     var touchTick by remember { mutableIntStateOf(0) }
     // ⚠️ showLyrics 不算「面板」：它是封面/歌词互换，不是盖在上面的浮层，
     // 算进去会导致「切到歌词就再也不进沉浸」，而那正是最需要沉浸的界面。
+
+    // v2.4.2：顶栏可达 —— 进度条按 ↑ 落到「⋯」，再 ←/→ 在 返回 / ⋯ 之间移动。
+    // v2.4.1 的路径是 进度条 ↑ → 根节点 ↑ → 上一首，顶栏根本没有入口，
+    // 用户报的「选不到右上角三个点」就是这个。
+    val topMoreFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val topBackFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    // 控制区里各面板按钮的 requester：关闭面板后把焦点还回去，
+    // 否则面板一关、菜单项节点消失，焦点就悬空了（用户报的「焦点丢失」）。
+    val queueFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val effectsFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val infoFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val focusReturn = remember { com.kmusic.apkhd.ui.tv.TvFocusReturn() }
+
     val anySheetOpen = showQueue || showMode || showQuality ||
         showEffects || showInfo || showMore || showPlaylistPicker || showNewPlaylist
+
+    // ── v2.4.2 · 面板分层返回 ──
+    // 以前 5 个面板一个 BackHandler 都没有，按 BACK 会一路落到 MainActivity 的
+    // 总处理器，而那里第一优先级是 `showPlayer -> showPlayer = false` ——
+    // 面板没关、整个播放页先被关掉，用户看到的就是「返回后焦点丢失」。
+    // 这里按「最内层先关」的顺序拦下来，都没开才交还给 MainActivity。
+    androidx.activity.compose.BackHandler(enabled = anySheetOpen) {
+        when {
+            showNewPlaylist -> { showNewPlaylist = false; showPlaylistPicker = true }
+            showPlaylistPicker -> showPlaylistPicker = false
+            showQueue -> showQueue = false
+            showEffects -> showEffects = false
+            showInfo -> { showInfo = false; onCancelAi() }
+            showMore -> showMore = false
+            showMode -> showMode = false
+            showQuality -> showQuality = false
+        }
+    }
+    // 面板全关之后把焦点还给「打开它的那个按钮」。
+    // 否则菜单项节点已从树上消失，焦点悬空，遥控器上下左右全无反应。
+    androidx.compose.runtime.LaunchedEffect(anySheetOpen) {
+        if (!anySheetOpen) focusReturn.restore()
+    }
     PlayerImmersiveMode(
         enabled = !anySheetOpen,
         interactionTick = touchTick
     )
+    // ── TV 遥控：播放页全屏，不该有焦点框，改用按键直控 ──
+    // 用 onPreviewKeyEvent 而不是 onKeyEvent：预览阶段从根往焦点项传，
+    // 能在焦点系统把 ←/→ 当成「移动焦点」之前先吃掉，否则按一次左键
+    // 只是把焦点从播放键挪到上一首，进度条纹丝不动。
+    val tv = isTvMode()
+    var tvHint by remember { mutableStateOf<String?>(null) }
+    var tvHintAt by remember { androidx.compose.runtime.mutableLongStateOf(0L) }
+    // 提示条 1.4s 后自动消失；用 key 变化重启这个协程
+    LaunchedEffect(tvHintAt) {
+        if (tvHintAt != 0L) {
+            kotlinx.coroutines.delay(1400)
+            if (System.currentTimeMillis() - tvHintAt >= 1400) tvHint = null
+        }
+    }
+    fun flashHint(text: String) {
+        tvHint = text
+        tvHintAt = System.currentTimeMillis()
+    }
+    // ⚠️ Compose 的按键事件只发给「有焦点的节点」及其祖先。播放页打开时页内没有
+    // 任何控件拿到焦点（全屏手势页，Tab/焦点都留在上一屏），于是 onPreviewKeyEvent
+    // 一次都收不到 —— 表现就是「遥控器在播放页完全没反应」。
+    // 所以必须给根节点挂 FocusRequester 并主动 requestFocus。
+    val rootFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    // v2.4.1：主播放键的 requester —— 根节点按 ↓ 直接进控制区，不靠几何搜索。
+    // 播放页控件在封面下方，几何搜索会先撞上不可聚焦的文字块，实测容易原地不动。
+    val playFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+
+    // 根节点自己是否持焦。**必须是它持焦时才接管方向键**：
+    // 否则根节点的 onPreviewKeyEvent 会先于一切吃掉 ←/→，
+    // 焦点永远进不了按钮（v2.4.0 的原始缺陷）。
+    var rootActive by remember { mutableStateOf(false) }
+
+    // v2.4.3：进播放页直接落在**控制区**（主播放键）——用户原话「进入播放页直接
+    // 就是控制区，不需要向下焦点才进入」。根节点只是按键接收器，让用户先站在一个
+    // 看不见的焦点上再按 ↓ 才见到高亮，等于白走一步。
+    //
+    // ⚠️ 必须「先根节点、再接力」，不能直接 requestFocus(playFocus)：
+    // `FocusRequester.requestFocus()` 只对**当前活跃焦点子树内**的节点生效。
+    // 播放页是覆盖层，进页那一刻活跃子树还在上一屏（侧栏/列表），跨子树请求
+    // **静默失败**——不抛异常，`requestFocusSafely()` 因此假报 true。
+    // 先请求根节点（它在播放页子树里、且是本页新组合的节点）把活跃子树切过来，
+    // 再接力给主播放键才有效。
+    //
+    // 接力不能靠返回值提前 return（同上，恒 true），固定打几轮兜住首帧布局差异。
+    // 以下写法已逐一实测无效，别再重走：awaitFrame/withFrameNanos 等帧、
+    // focusManager.moveFocus(Down)、view.dispatchKeyEvent、
+    // rootView.dispatchKeyEvent、onFocusChanged 里 post { requestFocus }。
+    LaunchedEffect(tv, track?.id) {
+        if (!tv) return@LaunchedEffect
+        // ① 先把焦点从上一屏（侧栏 / 列表面板）抢到播放页根节点。
+        //    `requestFocus()` 只对**当前活跃焦点子树内**的节点有效，播放页是
+        //    覆盖层、进页时活跃子树还在侧栏 → 直接 requestFocus(playFocus)
+        //    会静默失败（既不抛异常也不生效）。所以先占根节点，把活跃子树
+        //    换成播放页，再往下走。
+        runCatching { rootFocus.requestFocus() }
+        androidx.compose.runtime.withFrameNanos { }
+        // ② 再接力到控制区。**不能靠 `requestFocusSafely()` 的返回值提前
+        //    return** —— 它对「还没挂到焦点树」的 requester 也返回 true。
+        //    固定打几轮，最后一轮一定在布局完成之后。
+        for (delayMs in longArrayOf(40L, 80L, 180L)) {
+            kotlinx.coroutines.delay(delayMs)
+            runCatching { playFocus.requestFocus() }
+        }
+        com.kmusic.apkhd.data.DiagLog.log("TVKEY", "进播放页：已接力到控制区")
+    }
+    // 播放页的 ±N 秒跳转 —— 根节点（封面态）和进度条（控件态）共用一份逻辑，
+    // 避免两处各写一套导致「同一个动作、两个步长」。
+    // 决策逻辑抽在 TvSeek（纯函数，单测覆盖时长未知/越界/到头）。
+    val tvSeekBy: (Long) -> Unit = { deltaMs ->
+        when (val step = com.kmusic.apkhd.ui.tv.TvSeek.step(
+            positionMs = positionProvider(),
+            durationMs = durationMs,
+            deltaMs = deltaMs
+        )) {
+            is com.kmusic.apkhd.ui.tv.TvSeek.SeekStep.NeedsPlay -> {
+                // 冷启动恢复队列：位置有、时长还是 0。按右键先起播，
+                // 不然算出来是 NaN、onSeek 收到非法值，看起来就是「没反应」。
+                onTogglePlay()
+                flashHint("▶ 开始播放（时长加载中，再按 ←/→ 可跳转）")
+            }
+            is com.kmusic.apkhd.ui.tv.TvSeek.SeekStep.Jump -> {
+                onSeek(step.progress)
+                flashHint(
+                    (if (deltaMs < 0) "⏪ " else "⏩ ") +
+                        "${kotlin.math.abs(deltaMs) / 1000} 秒    " +
+                        formatMs(step.targetMs) + " / " + formatMs(durationMs)
+                )
+            }
+        }
+    }
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(c.bg)
             .restoreBarsOnTouch { touchTick++ }
+            .onFocusChanged { rootActive = it.isFocused }
+            .tvRootFocus(rootFocus, tv, down = playFocus)
+            .then(
+                if (!tv) Modifier else Modifier.onPreviewKeyEvent { ce: androidx.compose.ui.input.key.KeyEvent ->
+                    val e = ce.nativeKeyEvent
+                    if (e.action != android.view.KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
+                    // 有面板弹出时全部让给面板，避免上下键既切歌又挪焦点
+                    if (anySheetOpen) return@onPreviewKeyEvent false
+                    // v2.4.3：MENU 和 CHANNEL+/− 是「全局媒体键」，**不受焦点位置限制**。
+                    // 原来它们跟方向键一起被 `if (!rootActive) return` 挡在门外 ——
+                    // 焦点一进控制区（现在是进页默认状态），MENU 就废了，
+                    // 用户必须先把焦点退回根节点才能开「更多」，毫无道理。
+                    when (e.keyCode) {
+                        android.view.KeyEvent.KEYCODE_MENU -> {
+                            focusReturn.remember(if (rootActive) playFocus else topMoreFocus)
+                            showMode = false
+                            showMore = true
+                            return@onPreviewKeyEvent true
+                        }
+                        android.view.KeyEvent.KEYCODE_CHANNEL_UP -> { onNext(); flashHint("⏭ 下一首"); return@onPreviewKeyEvent true }
+                        android.view.KeyEvent.KEYCODE_CHANNEL_DOWN -> { onPrev(); flashHint("⏮ 上一首"); return@onPreviewKeyEvent true }
+                        else -> {}
+                    }
+                    // 焦点已经进了控制区（按钮 / 进度条）→ 方向键交还焦点系统。
+                    // 这一步是「控件能选中」的关键：不交还，←/→ 会被这里吃掉。
+                    if (!rootActive) return@onPreviewKeyEvent false
+                    when (e.keyCode) {
+                        android.view.KeyEvent.KEYCODE_DPAD_LEFT -> { tvSeekBy(-TvDimens.SEEK_STEP_MS); true }
+                        android.view.KeyEvent.KEYCODE_DPAD_RIGHT -> { tvSeekBy(TvDimens.SEEK_STEP_MS); true }
+                        android.view.KeyEvent.KEYCODE_DPAD_CENTER,
+                        android.view.KeyEvent.KEYCODE_ENTER,
+                        android.view.KeyEvent.KEYCODE_NUMPAD_ENTER -> { onTogglePlay(); flashHint(if (isPlaying) "⏸ 暂停" else "▶ 播放"); true }
+                        // v2.4.1：↓ 不再直接切歌 —— 而是把焦点送进控制区（落在主播放键）。
+                        // 理由：用户明确要求「控件焦点都要」，而焦点不进去就永远选不到按钮。
+                        // 切歌改在控制区里按 ←/→ 走到上一首/下一首按钮，或用 CHANNEL+/-。
+                        android.view.KeyEvent.KEYCODE_DPAD_DOWN -> {
+                            if (playFocus.requestFocusSafely()) {
+                                flashHint("↓ 已进入控制区 · ↑ 返回")
+                                true
+                            } else false
+                        }
+                        android.view.KeyEvent.KEYCODE_DPAD_UP -> { onPrev(); flashHint("⏮ 上一首"); true }
+                        else -> false
+                    }
+                }
+            )
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -316,6 +524,28 @@ fun PlayerScreen(
                 Text("暂无播放", color = c.t3, fontSize = 14.wsp)
             }
             return@Box
+        }
+
+        // ── TV 操作提示 ──
+        // 遥控器按键没有触觉反馈，必须给一个看得见的结果：
+        // 「⏩ 5 秒 1:23 / 4:05」就是按一下右键之后屏幕中央的那句话。
+        // 手机 / 车机 tvHint 恒为 null，这段不产生任何绘制。
+        if (tvHint != null) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Box(
+                    Modifier
+                        .clip(RoundedCornerShape(12.wdp))
+                        .background(Color(0xB3000000))
+                        .padding(horizontal = 22.wdp, vertical = 14.wdp)
+                ) {
+                    Text(
+                        text = tvHint!!,
+                        color = Color.White,
+                        fontSize = 20.wsp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
         }
 
         // ── 沉浸背景：封面放大 + 高斯模糊 + 压暗 ──────────────────────────
@@ -393,9 +623,13 @@ fun PlayerScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    NavIcon(IconBack) { onBack() }
+                    NavIcon(IconBack, requester = topBackFocus, down = playFocus) { onBack() }
                     Text("正在播放", color = c.t1, fontSize = 15.wsp, fontWeight = FontWeight.Medium)
-                    NavIcon(IconMore) { showMode = false; showMore = true }
+                    NavIcon(
+                        IconMore,
+                        requester = topMoreFocus,
+                        down = playFocus
+                    ) { showMode = false; focusReturn.remember(topMoreFocus); showMore = true }
                 }
                 Row(
                     Modifier
@@ -427,6 +661,7 @@ fun PlayerScreen(
                                     onSwipeDown = { onBack() },
                                     horizontalEnabled = false
                                 )
+                                .tvFocus()
                                 .clickable(
                                     indication = null,
                                     interactionSource = remember { MutableInteractionSource() }
@@ -495,7 +730,14 @@ fun PlayerScreen(
                                 )
                             }
                             Spacer(Modifier.height(10.wdp))
-                            SeekBar(progressProvider = progressProvider, onSeek = onSeek)
+                            SeekBar(
+                                progressProvider = progressProvider,
+                                onSeek = onSeek,
+                                tvSeekBy = if (tv) tvSeekBy else null,
+                                // v2.4.2：↑ 落到顶栏「⋯」，不再回根节点 ——
+                                // 回根节点后顶栏就永远够不着（用户报「选不到三个点」）
+                                up = topMoreFocus
+                            )
                             Spacer(Modifier.height(6.wdp))
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                 ElapsedTimeText(positionProvider = positionProvider, color = c.t3)
@@ -518,7 +760,14 @@ fun PlayerScreen(
                                     icon = if (isPlaying) IconPause else IconPlay,
                                     size = 54.wdp,
                                     iconSize = 16.dp,
-                                    emphasized = true
+                                    emphasized = true,
+                                    // 缓冲超时不改图标（改了就又回到「播放/暂停乱翻」），只叠圈
+                                    spinner = stalled,
+                                    // ↓ 的落点由根节点指派（tvRootFocus(down = playFocus)）。
+                                    // 这里**不设 up** —— 它正上方就是进度条，
+                                    // 一旦钉死 up=rootFocus，↑ 会越过进度条直接回根节点，
+                                    // 进度条就永远选不中了。
+                                    requester = playFocus
                                 ) { onTogglePlay() }
                                 CtrlButton(icon = IconNext, size = 46.wdp, iconSize = 16.wdp) { onNext() }
                                 CtrlButton(
@@ -530,9 +779,25 @@ fun PlayerScreen(
                             }
                             Spacer(Modifier.height(8.wdp))
                             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                                ToolItem(IconQueue, if (queue.isEmpty()) "队列" else "队列 ${queue.size}") { showQueue = true }
-                                ToolItem(IconEqualizer, "音效") { showEffects = true }
-                                ToolItem(IconInfo, "详情") { showInfo = true }
+                                ToolItem(
+                                    IconQueue,
+                                    if (queue.isEmpty()) "队列" else "队列 ${queue.size}",
+                                    requester = queueFocus,
+                                    onOpen = { focusReturn.remember(queueFocus) },
+                                    onClick = { showQueue = true }
+                                )
+                                ToolItem(
+                                    IconEqualizer, "音效",
+                                    requester = effectsFocus,
+                                    onOpen = { focusReturn.remember(effectsFocus) },
+                                    onClick = { showEffects = true }
+                                )
+                                ToolItem(
+                                    IconInfo, "详情",
+                                    requester = infoFocus,
+                                    onOpen = { focusReturn.remember(infoFocus) },
+                                    onClick = { showInfo = true }
+                                )
                             }
                         }
                     }
@@ -545,9 +810,13 @@ fun PlayerScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                NavIcon(IconBack) { onBack() }
+                NavIcon(IconBack, requester = topBackFocus, down = playFocus) { onBack() }
                 Text("正在播放", color = c.t1, fontSize = 15.wsp, fontWeight = FontWeight.Medium)
-                NavIcon(IconMore) { showMode = false; showMore = true }
+                NavIcon(
+                    IconMore,
+                    requester = topMoreFocus,
+                    down = playFocus
+                ) { showMode = false; focusReturn.remember(topMoreFocus); showMore = true }
             }
 
             // 中央方块：封面 ⇄ 歌词（同位置同大小）
@@ -570,6 +839,7 @@ fun PlayerScreen(
                             onSwipeToLyrics = { toLyrics -> showLyrics = toLyrics },
                             onSwipeDown = { onBack() }
                         )
+                        .tvFocus()
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -631,7 +901,13 @@ fun PlayerScreen(
             )
 
             Spacer(Modifier.height(18.wdp))
-            SeekBar(progressProvider = progressProvider, onSeek = onSeek)
+            SeekBar(
+                progressProvider = progressProvider,
+                onSeek = onSeek,
+                tvSeekBy = if (tv) tvSeekBy else null,
+                // v2.4.2：↑ 落到顶栏「⋯」——见宽屏那处的说明
+                up = topMoreFocus
+            )
             Spacer(Modifier.height(16.wdp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 ElapsedTimeText(positionProvider = positionProvider, color = c.t3)
@@ -659,7 +935,9 @@ fun PlayerScreen(
                     icon = if (isPlaying) IconPause else IconPlay,
                     size = 56.wdp,
                     iconSize = 16.dp,
-                    emphasized = true
+                    emphasized = true,
+                    spinner = stalled,
+                    requester = playFocus
                 ) { onTogglePlay() }
                 CtrlButton(icon = IconNext, size = 48.wdp, iconSize = 16.wdp) { onNext() }
                 CtrlButton(
@@ -727,6 +1005,29 @@ fun PlayerScreen(
             )
         }
 
+
+        // ── TV 操作提示（覆盖在所有面板之上，最后画） ──
+        // 遥控器按键没有触觉反馈，必须给一个看得见的结果：
+        // 「⏩ 5 秒 1:23 / 4:05」就是按一下右键之后屏幕中央的那句话。
+        // 手机 / 车机 tvHint 恒为 null，这段不产生任何绘制。
+        if (tvHint != null) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Box(
+                    Modifier
+                        .clip(RoundedCornerShape(12.wdp))
+                        .background(Color(0xB3000000))
+                        .padding(horizontal = 22.wdp, vertical = 14.wdp)
+                ) {
+                    Text(
+                        text = tvHint!!,
+                        color = Color.White,
+                        fontSize = 20.wsp,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+
         if (showMore) {
             MoreSheet(
                 onDownload = { onDownload(); showMore = false },
@@ -764,6 +1065,15 @@ fun PlayerScreen(
                 onEqEnabledChange = onEqEnabledChange,
                 onEqPresetChange = onEqPresetChange,
                 onEqBandChange = onEqBandChange,
+                deviceProfiles = deviceProfiles,
+                deviceProfileActiveId = deviceProfileActiveId,
+                hasConfirmedAudioRoute = hasConfirmedAudioRoute,
+                onSaveDeviceProfile = onSaveDeviceProfile,
+                onApplyDeviceProfile = onApplyDeviceProfile,
+                onDeleteDeviceProfile = onDeleteDeviceProfile,
+                onBindDeviceProfile = onBindDeviceProfile,
+                deviceProfileAuto = deviceProfileAuto,
+                onDeviceProfileAutoChange = onDeviceProfileAutoChange,
                 userEqPresets = userEqPresets,
                 onSaveEqCurve = onSaveEqCurve,
                 onApplyEqCurve = onApplyEqCurve,
@@ -777,6 +1087,7 @@ fun PlayerScreen(
                 fxSampleRate = fxSampleRate,
                 fxHeadroomDb = fxHeadroomDb,
                 audioOffload = audioOffload,
+                pureAudioMode = pureAudioMode,
                 dsdPlaying = dsdPlaying,
                 dsdLabel = dsdLabel,
                 dsdBypassEq = dsdBypassEq,
@@ -818,7 +1129,14 @@ fun PlayerScreen(
                 onSelect = { i -> onQueueSelect(i); showQueue = false },
                 onRemove = onQueueRemove,
                 onMove = onQueueMove,
-                onDismiss = { showQueue = false }
+                onDismiss = { showQueue = false },
+                onEmpty = {
+                    // 删空后关面板并把焦点还给「队列」入口（该按钮此刻仍在树上，
+                    // 不会像被删的行那样连带摘掉焦点）。
+                    showQueue = false
+                    focusReturn.remember(queueFocus)
+                    focusReturn.restore()
+                }
             )
         }
     }
@@ -838,18 +1156,81 @@ private fun QueueSheet(
     onSelect: (Int) -> Unit,
     onRemove: (Int) -> Unit,
     onMove: (Int, Int) -> Unit,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    tvMode: Boolean = LocalIsTv.current,
+    onEmpty: () -> Unit = {}
+) {
+    val content: @Composable () -> Unit = { QueueSheetContent(queue, currentIndex, onSelect, onRemove, onMove, onDismiss, tvMode, onEmpty) }
+    if (tvMode) {
+        // TV 面板必须有独立窗口/焦点子树；作为播放页兄弟 Column 时 requestFocus 会静默失败。
+        Popup(onDismissRequest = onDismiss, properties = PopupProperties(focusable = true)) { content() }
+    } else content()
+}
+
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun QueueSheetContent(
+    queue: List<Track>,
+    currentIndex: Int,
+    onSelect: (Int) -> Unit,
+    onRemove: (Int) -> Unit,
+    onMove: (Int, Int) -> Unit,
+    onDismiss: () -> Unit,
+    tvMode: Boolean,
+    onEmpty: () -> Unit
 ) {
     val c = moyinColors()
     val rowH = 56.wdp
     val rowPx = with(LocalDensity.current) { rowH.toPx() }
     var dragging by remember { mutableStateOf(-1) }
     var dragOffset by remember { mutableStateOf(0f) }
+    val panelFocus = rememberTvPanelFocus()
+    val panelRoot = remember { androidx.compose.ui.focus.FocusRequester() }
+    val listState = rememberLazyListState()
+    var tvIndex by remember { mutableIntStateOf(currentIndex.coerceAtLeast(0)) }
+    var centerDownAt by remember { mutableLongStateOf(0L) }
+    // 面板打开后焦点钉在容器上（多轮幂等，不看返回值）。
+    LaunchedEffect(tvMode, queue.isEmpty()) {
+        if (!tvMode || queue.isEmpty()) return@LaunchedEffect
+        for (delayMs in longArrayOf(60L, 180L, 360L)) {
+            kotlinx.coroutines.delay(delayMs)
+            panelRoot.requestFocusSafely()
+        }
+    }
+    // 索引移动时把目标行滚进视野。
+    LaunchedEffect(tvIndex, queue.size) {
+        if (tvMode && queue.isNotEmpty()) {
+            runCatching { listState.animateScrollToItem(tvIndex.coerceIn(0, queue.lastIndex)) }
+        }
+    }
+    if (tvMode) {
+        LaunchedEffect(queue.size) {
+            tvIndex = tvIndex.coerceIn(0, (queue.size - 1).coerceAtLeast(0))
+        }
+    }
+    if (tvMode && queue.isEmpty()) {
+        LaunchedEffect(Unit) { onEmpty() }
+    }
+    /**
+     * 删除一行并把高亮交给接管的曲目。
+     *
+     * 删除后接管下标 = 原位置下一首、删末项则新末项（[QueueContinuation.focusAfterRemoval]）。
+     * TV 路径上没有任何行是焦点节点，焦点始终钉在面板容器，所以这里只改索引。
+     */
+    fun deleteRowWithFocus(index: Int) {
+        if (tvMode) {
+            tvIndex = com.kmusic.apkhd.playback.QueueContinuation
+                .focusAfterRemoval(index, queue.size - 1) ?: 0
+        }
+        onRemove(index)
+    }
 
     Box(
         Modifier
             .fillMaxSize()
             .background(Color(0x99000000))
+            // 遮罩只负责点击关闭，不参与焦点（否则会跟面板里的真实控件抢）
+            .focusProperties { canFocus = false }
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -869,11 +1250,54 @@ private fun QueueSheet(
                     else RoundedCornerShape(topStart = 18.wdp, topEnd = 18.wdp)
                 )
                 .background(if (c.isDark) c.s1 else Color(0xFFFFFFFF))
-                // 吃掉点击，避免穿透到遮罩把面板关掉
-                .clickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() }
-                ) { }
+                // 用 pointerInput 吞掉空白区点击，**不要用 clickable**：
+                // clickable 自带 focusable 语义，会给面板容器建一个可聚焦节点，
+                // 配合下面的 tvPanelGroup 时这个空壳会自己抢到焦点 ——
+                // 表现为「面板开了、里面一行高亮都没有、方向键乱跑」。
+                .pointerInput(Unit) {
+                    detectTapGestures { }
+                }
+                // v2.4.4：TV 面板改「单焦点根 + 索引高亮」。
+                // 之前每行各自是焦点节点，删除时持焦行被摘掉，Popup 内后续所有
+                // requestFocus 都静默失败（实测删除后无一行 hasFocus）→ 用户看到失焦。
+                // 现在焦点永远钉在这个容器上，行只是高亮，删除只改索引。
+                .then(
+                    if (tvMode) Modifier
+                        .focusRequester(panelRoot)
+                        .focusable()
+                        .onKeyEvent { ev ->
+                            if (ev.nativeKeyEvent.keyCode == 23 || ev.nativeKeyEvent.keyCode == 66) {
+                                if (ev.type == KeyEventType.KeyDown) {
+                                    // 遥控器长按会持续发 repeatCount>0 的 KeyDown；
+                                    // adb/部分盒子只发一次 DOWN，所以同时记时间戳兜底。
+                                    if (ev.nativeKeyEvent.repeatCount == 0) {
+                                        centerDownAt = System.currentTimeMillis()
+                                    } else if (System.currentTimeMillis() - centerDownAt >= 600L) {
+                                        if (queue.isNotEmpty()) deleteRowWithFocus(tvIndex)
+                                        centerDownAt = 0L
+                                    }
+                                    return@onKeyEvent true
+                                }
+                                if (ev.type == KeyEventType.KeyUp) {
+                                    val held = if (centerDownAt == 0L) 0L else System.currentTimeMillis() - centerDownAt
+                                    centerDownAt = 0L
+                                    if (queue.isNotEmpty()) {
+                                        if (held >= 600L) deleteRowWithFocus(tvIndex) else onSelect(tvIndex)
+                                    }
+                                    return@onKeyEvent true
+                                }
+                            }
+                            if (ev.type != KeyEventType.KeyDown) return@onKeyEvent false
+                            when (ev.nativeKeyEvent.keyCode) {
+                                19 -> { if (tvIndex > 0) tvIndex--; true }        // DPAD_UP
+                                20 -> { if (tvIndex < queue.lastIndex) tvIndex++; true } // DPAD_DOWN
+                                21, 22 -> true                                   // DPAD 左右
+                                4 -> { onDismiss(); true }                       // BACK
+                                else -> false
+                            }
+                        }
+                    else Modifier
+                )
                 // 底部让位：车机底栏不上报 inset，「随机播放」那一行会被压在图标栏下面
                 .sheetBottomPadding(!drawer)
                 .padding(top = 14.wdp, bottom = 8.wdp)
@@ -898,15 +1322,20 @@ private fun QueueSheet(
                     Text("队列是空的", color = c.t3, fontSize = 13.wsp)
                 }
             } else {
-                LazyColumn(Modifier.fillMaxSize()) {
+                LazyColumn(Modifier.fillMaxSize(), state = listState) {
                     itemsIndexed(queue, key = { _, t -> t.id }) { i, t ->
                         val on = i == currentIndex
                         val isDrag = dragging == i
+                        // TV 模式下各行不再是焦点节点：高亮跟 tvIndex 走，按键由面板根接管。
+                        val tvSel = tvMode && i == tvIndex
                         Row(
                             Modifier
                                 .fillMaxWidth()
+                                // 面板根的按键接管后，行不再是焦点节点。
                                 .height(rowH)
                                 .zIndex(if (isDrag) 1f else 0f)
+                                .clip(RoundedCornerShape(8.wdp))
+                                .then(if (tvSel) Modifier.background(c.accent.copy(alpha = 0.22f)) else Modifier)
                                 .graphicsLayer {
                                     translationY = if (isDrag) dragOffset else 0f
                                     // 拖动中的那一行浮起来，给一点层级感
@@ -919,12 +1348,17 @@ private fun QueueSheet(
                                         else -> Color.Transparent
                                     }
                                 )
-                                .pointerInput(Unit) {
-                                    detectTapGestures(
-                                        onLongPress = { },
-                                        onTap = { if (dragging < 0) onSelect(i) }
-                                    )
-                                }
+                                // TV：行不再可点焦点，点击/长按由面板根统一处理；
+                                // 这里只留触摸点按（触屏或鼠标点选）。
+                                .then(
+                                    if (tvMode) Modifier.pointerInput(i, queue.size) {
+                                        detectTapGestures { onSelect(i) }
+                                    } else Modifier.clickable(
+                                        indication = null,
+                                        interactionSource = remember { MutableInteractionSource() }
+                                    ) { if (dragging < 0) onSelect(i) }
+                                )
+                                // 长按拖动排序保留（触摸 / 鼠标用；遥控器没有长按语义）
                                 .pointerInput(queue.size, i) {
                                     detectDragGesturesAfterLongPress(
                                         onDragStart = {
@@ -981,10 +1415,16 @@ private fun QueueSheet(
                                 Modifier
                                     .size(36.wdp)
                                     .clip(RoundedCornerShape(10.wdp))
-                                    .clickable(
-                                        indication = null,
-                                        interactionSource = remember { MutableInteractionSource() }
-                                    ) { onRemove(i) },
+                                    .then(
+                                        if (tvMode) Modifier.pointerInput(i, queue.size) {
+                                            detectTapGestures { deleteRowWithFocus(i) }
+                                        } else Modifier
+                                            .tvFocus(shape = RoundedCornerShape(10.wdp))
+                                            .clickable(
+                                                indication = null,
+                                                interactionSource = remember { MutableInteractionSource() }
+                                            ) { deleteRowWithFocus(i) }
+                                    ),
                                 contentAlignment = Alignment.Center
                             ) {
                                 MoyinIcon(icon = IconClose, tint = c.t3, size = 14.wdp)
@@ -1217,6 +1657,7 @@ private fun LyricOffsetChip(label: String, onClick: () -> Unit) {
         fontSize = 10.wsp,
         modifier = Modifier
             .clip(RoundedCornerShape(99.dp))
+            .tvFocus(shape = RoundedCornerShape(99.dp))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -1232,6 +1673,10 @@ private fun offsetLabel(ms: Long): String =
 @Composable
 private fun NavIcon(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
+    /** v2.4.2：TV 上由播放页指派焦点入口 / 上下出口 */
+    requester: androidx.compose.ui.focus.FocusRequester? = null,
+    down: androidx.compose.ui.focus.FocusRequester? = null,
+    up: androidx.compose.ui.focus.FocusRequester? = null,
     onClick: () -> Unit
 ) {
     val c = moyinColors()
@@ -1242,6 +1687,14 @@ private fun NavIcon(
             .size(44.wdp)
             .clip(RoundedCornerShape(99.dp))
             .background(if (c.isDark) Color(0x33FFFFFF) else Color(0x14000000))
+            // requester 必须在 clickable 之前：clickable 自己也会建焦点节点，
+            // 顺序反了 requester 会绑到外层空节点上，requestFocus 落不到按钮
+            .then(if (requester != null) Modifier.focusRequester(requester) else Modifier)
+            .focusProperties {
+                if (down != null) this.down = down
+                if (up != null) this.up = up
+            }
+            .tvFocus(shape = RoundedCornerShape(99.dp))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -1259,6 +1712,11 @@ private fun CtrlButton(
     iconSize: androidx.compose.ui.unit.Dp,
     emphasized: Boolean = false,
     tint: Color? = null,
+    /** v2.4.1：TV 上由播放页指定焦点入口 / 上行出口 */
+    requester: androidx.compose.ui.focus.FocusRequester? = null,
+    up: androidx.compose.ui.focus.FocusRequester? = null,
+    /** v2.4.8：缓冲超过 3 秒才叠加载圈；图标本身不跟着变（否则就是「乱翻」） */
+    spinner: Boolean = false,
     onClick: () -> Unit
 ) {
     val c = moyinColors()
@@ -1281,6 +1739,11 @@ private fun CtrlButton(
                 color = if (c.isDark) Color(0x24FFFFFF) else Color(0x1A000000),
                 shape = RoundedCornerShape(99.dp)
             )
+            // 焦点入口必须在 clickable 之前：clickable 也会建焦点节点，
+            // 顺序反了 requester 绑到外层空节点上，requestFocus 就落不到按钮
+            .then(if (requester != null) Modifier.focusRequester(requester) else Modifier)
+            .focusProperties { if (up != null) this.up = up }
+            .tvFocus()
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -1296,6 +1759,14 @@ private fun CtrlButton(
             },
             size = iconSize
         )
+        // 缓冲超时：图标不动，只在下面/上面叠一个小圈，避免「按钮一直在播放和暂停之间跳」
+        if (spinner) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(size * 0.9f),
+                color = if (emphasized) c.onAccent else c.accent,
+                strokeWidth = 1.5.dp
+            )
+        }
     }
 }
 
@@ -1303,6 +1774,10 @@ private fun CtrlButton(
 private fun ToolItem(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     label: String,
+    /** v2.4.2：焦点入口；面板关闭后靠它把焦点还回来 */
+    requester: androidx.compose.ui.focus.FocusRequester? = null,
+    /** 面板打开前调用，记住「是谁开的」 */
+    onOpen: () -> Unit = {},
     onClick: () -> Unit
 ) {
     val c = moyinColors()
@@ -1310,10 +1785,12 @@ private fun ToolItem(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .clip(RoundedCornerShape(99.dp))
+            .then(if (requester != null) Modifier.focusRequester(requester) else Modifier)
+            .tvFocus(shape = RoundedCornerShape(99.dp))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
-            ) { onClick() }
+            ) { onOpen(); onClick() }
             .padding(12.wdp)
     ) {
         MoyinIcon(icon = icon, tint = c.t3, size = 17.wdp)
@@ -1328,12 +1805,19 @@ private fun ToolItem(
  * - 触摸区做到 24dp 高（视觉条只有 4dp），否则手指点不中
  * - 拖动中显示拖动位置，不被后台 100ms 轮询的播放位置覆盖
  * - 松手才 seek，拖动过程不 seek（避免频繁 seek 导致卡顿）
+ * - v2.4.1：TV 上它自己是**可聚焦控件**，←/→ 调进度（与顶栏快捷键同频，±5 秒），
+ *   ↑/↓ 交还焦点系统。之前它是纯 `Box + pointerInput`，
+ *   物理上不是焦点目标，遥控器怎么按都选不中。
  */
 @Composable
 private fun SeekBar(
     /** 播放进度（0~1）的提供者。读在这一层，100ms 的轮询只会重组这条进度条 */
     progressProvider: () -> Float,
-    onSeek: (Float) -> Unit
+    onSeek: (Float) -> Unit,
+    /** TV：进度条持焦时左右键的跳转动作（null = 纯展示，不接管按键） */
+    tvSeekBy: ((Long) -> Unit)? = null,
+    /** TV：按 ↑ 时把焦点交回去（一般是播放页根节点） */
+    up: androidx.compose.ui.focus.FocusRequester? = null
 ) {
     val c = moyinColors()
     var barWidth by remember { mutableStateOf(1) }
@@ -1346,6 +1830,28 @@ private fun SeekBar(
             .fillMaxWidth()
             .height(24.wdp)
             .onSizeChanged { barWidth = it.width.coerceAtLeast(1) }
+            .then(
+                if (tvSeekBy == null) Modifier else Modifier
+                    .focusProperties { if (up != null) this.up = up }
+                    .tvFocus(shape = RoundedCornerShape(8.dp), scale = 1f)
+                    // tvFocus 只画描边、不建焦点节点；进度条没有 clickable，
+                    // 必须显式 focusable() 它才是一个能被遥控器选中的目标
+                    .focusable()
+                    .onPreviewKeyEvent { ce ->
+                        val e = ce.nativeKeyEvent
+                        if (e.action != android.view.KeyEvent.ACTION_DOWN) return@onPreviewKeyEvent false
+                        // 进度条自身没有"滚动"语义，左右键此刻唯一的合理含义就是调进度。
+                        // 具体的 ±5 秒换算交给调用方（复用 TvSeek 的越界/时长未知判定）。
+                        val dir = when (e.keyCode) {
+                            android.view.KeyEvent.KEYCODE_DPAD_LEFT -> -1L
+                            android.view.KeyEvent.KEYCODE_DPAD_RIGHT -> 1L
+                            else -> 0L
+                        }
+                        if (dir == 0L) return@onPreviewKeyEvent false
+                        tvSeekBy(dir * TvDimens.SEEK_STEP_MS)
+                        true
+                    }
+            )
             .pointerInput(Unit) {
                 detectTapGestures { offset ->
                     onSeek((offset.x / barWidth).coerceIn(0f, 1f))
@@ -1442,6 +1948,15 @@ private fun EffectSheet(
     onEqPresetChange: (Int) -> Unit,
     onEqBandChange: (Int, Int) -> Unit,
     /** 用户自建曲线（A3） */
+    deviceProfiles: List<com.kmusic.apkhd.data.DeviceEqProfile> = emptyList(),
+    deviceProfileActiveId: String? = null,
+    hasConfirmedAudioRoute: Boolean = false,
+    onSaveDeviceProfile: (String, Boolean) -> Unit = { _, _ -> },
+    onApplyDeviceProfile: (String?) -> Unit = {},
+    onDeleteDeviceProfile: (String) -> Unit = {},
+    onBindDeviceProfile: (String) -> Unit = {},
+    deviceProfileAuto: Boolean = false,
+    onDeviceProfileAutoChange: (Boolean) -> Unit = {},
     userEqPresets: List<com.kmusic.apkhd.playback.UserEqPresets.Preset> = emptyList(),
     onSaveEqCurve: (String) -> Unit = {},
     onApplyEqCurve: (com.kmusic.apkhd.playback.UserEqPresets.Preset) -> Unit = {},
@@ -1458,6 +1973,7 @@ private fun EffectSheet(
     /** 让给 EQ 正增益峰值的前级余量（dB） */
     fxHeadroomDb: Float = 0f,
     audioOffload: Boolean,
+    pureAudioMode: Boolean,
     /** 正在播 DSD（音效面板据此提示「均衡器已自动旁路」） */
     dsdPlaying: Boolean = false,
     /** DSD 倍率标签 */
@@ -1478,14 +1994,16 @@ private fun EffectSheet(
     // 注意只折滑块 —— 均衡器/预设/低音/响度这些行始终可见。
     var slidersOpen by remember { mutableStateOf(false) }
     // A3：保存曲线的命名浮层 + 当前生效的用户曲线名（只用于列表高亮）
-    var savingCurve by remember { mutableStateOf(false) }
     var activeCurveName by remember { mutableStateOf<String?>(null) }
+    val panelFocus = rememberTvPanelFocus()
     val noInd = { _: MutableInteractionSource -> }
 
     Box(
         Modifier
             .fillMaxSize()
             .background(Color(0x99000000))
+            // 遮罩只负责点击关闭，不参与焦点（否则会跟面板里的真实控件抢）
+            .focusProperties { canFocus = false }
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -1505,10 +2023,15 @@ private fun EffectSheet(
                     else RoundedCornerShape(topStart = 20.wdp, topEnd = 20.wdp)
                 )
                 .background(if (c.isDark) c.s1 else Color(0xFFFFFFFF))
-                .clickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() }
-                ) { }
+                // 用 pointerInput 吞掉空白区点击，**不要用 clickable**：
+                // clickable 自带 focusable 语义，会给面板容器建一个可聚焦节点，
+                // 配合下面的 tvPanelGroup 时这个空壳会自己抢到焦点 ——
+                // 表现为「面板开了、里面一行高亮都没有、方向键乱跑」。
+                .pointerInput(Unit) {
+                    detectTapGestures { }
+                }
+                // v2.4.3：面板整体成为焦点组，首项 ↑ / 末项 ↓ 不再跳出面板
+                .tvPanelGroup()
                 .sheetBottomPadding(!drawer)
                 .verticalScroll(rememberScrollState())
                 .padding(top = 16.wdp, bottom = 28.wdp)
@@ -1532,6 +2055,8 @@ private fun EffectSheet(
                     Modifier
                         .size(40.wdp)
                         .clip(RoundedCornerShape(20.wdp))
+                        .focusRequester(panelFocus)
+                        .tvFocus(shape = RoundedCornerShape(20.wdp))
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -1562,7 +2087,8 @@ private fun EffectSheet(
                     sampleRateHz = fxSampleRate.takeIf { it > 0 },
                     headroomDb = fxHeadroomDb,
                     loudnessAppliedDb = appliedDb,
-                    loudnessRequestedDb = requestedDb
+                    loudnessRequestedDb = requestedDb,
+                    pureAudioMode = pureAudioMode
                 )
                 val (line, tone) = when (status) {
                     is FxStatus.Active -> {
@@ -1615,7 +2141,9 @@ private fun EffectSheet(
                     }
                     is FxStatus.Bypassed -> when (status.reason) {
                         FxStatus.Bypassed.Reason.OFFLOAD ->
-                            "已旁路：省电播放（音频直通 DSP）" to c.t3
+                            "已旁路：请求省电播放（实际生效见详情）" to c.t3
+                        FxStatus.Bypassed.Reason.PURE_PCM ->
+                            "已旁路：纯净PCM（高精度请求，不保证最终输出）" to c.t3
                         FxStatus.Bypassed.Reason.DSD ->
                             "已旁路：DSD 解码中（设置已保留）" to c.t3
                         FxStatus.Bypassed.Reason.ALL_OFF ->
@@ -1634,11 +2162,10 @@ private fun EffectSheet(
                 )
             }
 
-            if (audioOffload) {
+            if (audioOffload || pureAudioMode) {
                 // offload 时整条音效链都没挂上 —— 与其显示一堆点了没反应的开关，不如说清楚
                 Text(
-                    "省电播放已开启：音频直通 DSP，均衡器与全部音效不可用。" +
-                        "关闭「省电播放」后重新起播即可恢复。",
+                    "当前模式不使用音效。选择“日常播放”即可使用，已保存的方案会保留。",
                     color = c.t3,
                     fontSize = 12.wsp,
                     lineHeight = 18.wsp,
@@ -1650,9 +2177,7 @@ private fun EffectSheet(
             // 用户设了 EQ 却发现没声音/没效果，不提示会以为 App 出 bug。
             if (dsdPlaying && dsdBypassEq && eqBands.isNotEmpty()) {
                 Text(
-                    "正在播放 ${dsdLabel ?: "DSD"}：均衡器已自动旁路" +
-                        "（DSD 解码链占满 CPU，EQ 会导致卡顿）。" +
-                        "你的均衡器设置已保留，切回普通格式立刻恢复。",
+                    "当前音频按默认方式播放，音效设置已保留。",
                     color = c.t3,
                     fontSize = 12.wsp,
                     lineHeight = 18.wsp,
@@ -1704,35 +2229,13 @@ private fun EffectSheet(
                     }
                 }
 
-                // A3 · 用户曲线：只有「保存当前曲线」一个动作，不加开关。
-                // 用户曲线与内置预设并列显示，选中后 eqCustom=true。
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 18.wdp, vertical = 2.wdp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        Modifier
-                            .clip(RoundedCornerShape(99.dp))
-                            .background(if (c.isDark) Color(0x14FFFFFF) else Color(0x0A000000))
-                            .clickable(
-                                indication = null,
-                                interactionSource = remember { MutableInteractionSource() }
-                            ) { savingCurve = true }
-                            .padding(horizontal = 13.wdp, vertical = 7.wdp)
-                    ) {
-                        Text("保存当前曲线", color = c.t2, fontSize = 12.wsp)
-                    }
-                    if (userEqPresets.isNotEmpty()) {
-                        Spacer(Modifier.width(8.wdp))
-                        Text(
-                            "我的 ${userEqPresets.size} 条",
-                            color = c.t3,
-                            fontSize = 11.wsp
-                        )
-                    }
-                }
+                com.kmusic.apkhd.ui.components.SoundSchemeSection(
+                    profiles = deviceProfiles, activeId = deviceProfileActiveId,
+                    hasConfirmedRoute = hasConfirmedAudioRoute,
+                    onSave = onSaveDeviceProfile, onApply = onApplyDeviceProfile,
+                    onDelete = onDeleteDeviceProfile, onBind = onBindDeviceProfile,
+                    deviceAutoEnabled = deviceProfileAuto, onDeviceAutoChange = onDeviceProfileAutoChange
+                )
                 if (userEqPresets.isNotEmpty()) {
                     UserCurveList(
                         presets = userEqPresets,
@@ -1779,7 +2282,7 @@ private fun EffectSheet(
             FxRow(
                 title = "低音增强",
                 value = fxStrengthLabel(fxBass),
-                available = !audioOffload,
+                available = !audioOffload && !pureAudioMode,
                 starved = false,
                 expanded = expanded == "bass",
                 onClick = { expanded = if (expanded == "bass") null else "bass" }
@@ -1789,7 +2292,7 @@ private fun EffectSheet(
             FxRow(
                 title = "响度增强",
                 value = if (fxLoudness <= 0) "关" else "+${fxLoudness / 100} dB",
-                available = !audioOffload,
+                available = !audioOffload && !pureAudioMode,
                 starved = false,
                 expanded = expanded == "loud",
                 onClick = { expanded = if (expanded == "loud") null else "loud" }
@@ -1800,7 +2303,7 @@ private fun EffectSheet(
             // 池位占用那行已经删掉了（v2.3.5）：音效跑在播放链上，
             // 无论开几项都**不占系统音效槽**。继续写「占用 N 项」反而会让人以为
             // 还是老机制、还得操心池位。这里只留一句事实。
-            if (!audioOffload) {
+            if (!audioOffload && !pureAudioMode) {
                 Text(
                     "均衡器 / 低音 / 响度都跑在播放链上，不占系统音效槽 —— " +
                         "开几项都不会影响别的 App，也不会有「资源被占满」。",
@@ -1833,19 +2336,7 @@ private fun EffectSheet(
         }
         // A3：命名浮层单独一层，盖在抽屉上（抽屉是 verticalScroll，塞在里面的输入框
         // 会被滚走，键盘弹出时也不好看）
-        if (savingCurve) {
-            SaveCurveDialog(
-                suggestion = suggestedCurveName(
-                    eqCustom,
-                    eqPresets.getOrNull(eqPreset) ?: eqPresets.firstOrNull()
-                ),
-                onDismiss = { savingCurve = false },
-                onConfirm = { name ->
-                    onSaveEqCurve(name)
-                    savingCurve = false
-                }
-            )
-        }
+
     }
 }
 
@@ -1880,6 +2371,7 @@ private fun EffectRow(
     Row(
         Modifier
             .fillMaxWidth()
+            .tvFocus(fullWidth = true)
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -1935,6 +2427,7 @@ private fun FxRow(
     Row(
         Modifier
             .fillMaxWidth()
+            .tvFocus(fullWidth = true)
             .clickable(
                 enabled = available,
                 indication = null,
@@ -1991,6 +2484,7 @@ private fun ChipRow(
                         if (on) c.accent
                         else if (c.isDark) Color(0x14FFFFFF) else Color(0x0A000000)
                     )
+                    .tvFocus()
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -2031,10 +2525,13 @@ private fun OptionSheet(
     onDismiss: () -> Unit
 ) {
     val c = moyinColors()
+    val panelFocus = rememberTvPanelFocus()
     Box(
         Modifier
             .fillMaxSize()
             .background(Color(0x99000000))
+            // 遮罩只负责点击关闭，不参与焦点（否则会跟面板里的真实控件抢）
+            .focusProperties { canFocus = false }
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -2046,10 +2543,15 @@ private fun OptionSheet(
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(topStart = 18.wdp, topEnd = 18.wdp))
                 .background(if (c.isDark) c.s1 else Color(0xFFFFFFFF))
-                .clickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() }
-                ) { }
+                // 用 pointerInput 吞掉空白区点击，**不要用 clickable**：
+                // clickable 自带 focusable 语义，会给面板容器建一个可聚焦节点，
+                // 配合下面的 tvPanelGroup 时这个空壳会自己抢到焦点 ——
+                // 表现为「面板开了、里面一行高亮都没有、方向键乱跑」。
+                .pointerInput(Unit) {
+                    detectTapGestures { }
+                }
+                // v2.4.3：面板整体成为焦点组，首项 ↑ / 末项 ↓ 不再跳出面板
+                .tvPanelGroup()
                 .sheetBottomPadding()
                 .padding(top = 14.wdp, bottom = 14.wdp)
         ) {
@@ -2061,11 +2563,13 @@ private fun OptionSheet(
                 modifier = Modifier.padding(horizontal = 18.wdp)
             )
             Spacer(Modifier.height(8.wdp))
-            options.forEach { (key, label) ->
+            options.forEachIndexed { oi, (key, label) ->
                 val on = key == selected
                 Row(
                     Modifier
                         .fillMaxWidth()
+                        .then(if (oi == 0) Modifier.focusRequester(panelFocus) else Modifier)
+                        .tvFocus()
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -2113,10 +2617,13 @@ private fun MoreSheet(
     val c = moyinColors()
     // B5：精确输入浮层（"offset" / "font"），null = 不显示
     var numericEdit by remember { mutableStateOf<String?>(null) }
+    val panelFocus = rememberTvPanelFocus()
     Box(
         Modifier
             .fillMaxSize()
             .background(Color(0x99000000))
+            // 遮罩只负责点击关闭，不参与焦点（否则会跟面板里的真实控件抢）
+            .focusProperties { canFocus = false }
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -2136,19 +2643,33 @@ private fun MoreSheet(
                     else RoundedCornerShape(topStart = 18.wdp, topEnd = 18.wdp)
                 )
                 .background(if (c.isDark) c.s1 else Color(0xFFFFFFFF))
-                .clickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() }
-                ) { }
+                // 用 pointerInput 吞掉空白区点击，**不要用 clickable**：
+                // clickable 自带 focusable 语义，会给面板容器建一个可聚焦节点，
+                // 配合下面的 tvPanelGroup 时这个空壳会自己抢到焦点 ——
+                // 表现为「面板开了、里面一行高亮都没有、方向键乱跑」。
+                .pointerInput(Unit) {
+                    detectTapGestures { }
+                }
+                // v2.4.3：面板整体成为焦点组，首项 ↑ / 末项 ↓ 不再跳出面板
+                .tvPanelGroup()
                 .sheetBottomPadding(!drawer)
                 .padding(top = 14.wdp, bottom = 14.wdp)
         ) {
-            if (qualityLabel.isNotEmpty()) {
-                MoreRow(IconEqualizer, "音质：$qualityLabel", onQualityClick)
+            // 首项定焦：有音质行就落在音质，没有就落在下载。
+            // 同一个 FocusRequester **只能挂一个节点**（挂两处会抛
+            // "FocusRequester is already in use"），所以按条件二选一。
+            // focus 参数必须显式命名 —— onClick 在它后面，位置传参会错位。
+            val headOnQuality = qualityLabel.isNotEmpty()
+            if (headOnQuality) {
+                MoreRow(IconEqualizer, "音质：$qualityLabel", focus = panelFocus, onClick = onQualityClick)
             }
-            MoreRow(IconDownload, "下载", onDownload)
-            MoreRow(IconPlus, "加入播放队列", onAddToQueue)
-            MoreRow(IconPlaylist, "加入歌单", onAddToPlaylist)
+            MoreRow(
+                IconDownload, "下载",
+                focus = if (headOnQuality) null else panelFocus,
+                onClick = onDownload
+            )
+            MoreRow(IconPlus, "加入播放队列", onClick = onAddToQueue)
+            MoreRow(IconPlaylist, "加入歌单", onClick = onAddToPlaylist)
 
             // ── 歌词 ────────────────────────────────────────────
             // 放这里而不是歌词区：歌词区被两行 chip 压掉 ~110dp，横屏只剩几行词。
@@ -2276,6 +2797,7 @@ private fun MoreStepper(
             Modifier
                 .width(58.wdp)
                 .clip(RoundedCornerShape(99.dp))
+                .tvFocus(shape = RoundedCornerShape(99.dp))
                 .clickable(
                     indication = null,
                     interactionSource = remember { MutableInteractionSource() }
@@ -2316,6 +2838,7 @@ private fun MoreChip(label: String, onClick: () -> Unit) {
             .padding(horizontal = 3.wdp)
             .clip(RoundedCornerShape(99.wdp))
             .background(if (c.isDark) Color(0x1FFFFFFF) else Color(0x0F000000))
+            .tvFocus(shape = RoundedCornerShape(99.wdp))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -2328,12 +2851,17 @@ private fun MoreChip(label: String, onClick: () -> Unit) {
 private fun MoreRow(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     label: String,
+    // focus 必须排在 onClick 之前：onClick 是尾随 lambda 的落点，
+    // 放最后会把这个函数类型参数挤掉，调用处直接编译失败
+    focus: androidx.compose.ui.focus.FocusRequester? = null,
     onClick: () -> Unit
 ) {
     val c = moyinColors()
     Row(
         Modifier
             .fillMaxWidth()
+            .then(if (focus != null) Modifier.focusRequester(focus) else Modifier)
+            .tvFocus()
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -2417,11 +2945,14 @@ private fun InfoSheet(
 
     // 0 = 导赏，1 = 音频信息。默认导赏：用户点「详情」十次有九次是想看内容。
     var tab by remember { mutableStateOf(0) }
+    val panelFocus = rememberTvPanelFocus()
 
     Box(
         Modifier
             .fillMaxSize()
             .background(Color(0x99000000))
+            // 遮罩只负责点击关闭，不参与焦点（否则会跟面板里的真实控件抢）
+            .focusProperties { canFocus = false }
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -2445,10 +2976,15 @@ private fun InfoSheet(
                     else MoyinShape.sheetTop
                 )
                 .background(if (c.isDark) c.s1 else Color(0xFFFFFFFF))
-                .clickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() }
-                ) { }
+                // 用 pointerInput 吞掉空白区点击，**不要用 clickable**：
+                // clickable 自带 focusable 语义，会给面板容器建一个可聚焦节点，
+                // 配合下面的 tvPanelGroup 时这个空壳会自己抢到焦点 ——
+                // 表现为「面板开了、里面一行高亮都没有、方向键乱跑」。
+                .pointerInput(Unit) {
+                    detectTapGestures { }
+                }
+                // v2.4.3：面板整体成为焦点组，首项 ↑ / 末项 ↓ 不再跳出面板
+                .tvPanelGroup()
                 .sheetBottomPadding(!drawer)
         ) {
             // ── 顶部：标题 + 分段 ──
@@ -2477,6 +3013,8 @@ private fun InfoSheet(
                         Modifier
                             .size(40.wdp)
                             .clip(RoundedCornerShape(20.wdp))
+                            .focusRequester(panelFocus)
+                            .tvFocus(shape = RoundedCornerShape(20.wdp))
                             .clickable(
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() }
@@ -2549,6 +3087,7 @@ private fun SegmentBar(labels: List<String>, selected: Int, onSelect: (Int) -> U
                 Modifier
                     .clip(RoundedCornerShape(99.dp))
                     .background(if (on) c.accentDim else Color.Transparent)
+                    .tvFocus(shape = RoundedCornerShape(99.dp))
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -2679,6 +3218,7 @@ private fun GuideTextAction(label: String, onClick: () -> Unit) {
     Box(
         Modifier
             .clip(RoundedCornerShape(8.dp))
+            .tvFocus(shape = RoundedCornerShape(8.dp))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -2838,13 +3378,26 @@ private fun AudioInfoSection(
                     }
                 } ?: "未知"
             )
-            InfoRow("码率", info.bitrateKbps?.let { "$it kbps" } ?: "未知")
-            InfoRow("设备输出", info.outSampleRate?.let { fmtHz(it) } ?: "未知")
-            val sr = info.sampleRate
-            val osr = info.outSampleRate
-            if (sr != null && osr != null && sr != osr) {
-                InfoRow("重采样", "是（${fmtHz(sr)} → ${fmtHz(osr)}）")
+            InfoRow(
+                "码率",
+                info.bitrateKbps?.let {
+                    if (info.bitrateFromSource) "$it kbps（源站标称）" else "$it kbps"
+                } ?: "未知"
+            )
+            // 单曲体积（v2.4.10）：母带 5.4Mbps × 3:30 ≈ 140MB。
+            // 用户看到这个数字才知道「母带」意味着什么，而不是只看到四个字。
+            if (info.estimatedBytes > 0) {
+                val mb = info.estimatedBytes / 1024f / 1024f
+                InfoRow("单曲体积", "%.0f MB".format(mb))
             }
+            InfoRow("应用输出", info.outputDescription ?: "未知（尚未确认AudioTrack）")
+            InfoRow("当前路由", info.outputDevice ?: "未知")
+            InfoRow("播放管线", if (info.pureAudioMode) "纯净PCM（高精度请求）" else "普通 / 省电偏好")
+            InfoRow("硬件省电", info.offloadStatus)
+            InfoRow("中断恢复", info.interruptionStatus)
+            InfoRow("USB高保真", info.usbOutputStatus)
+            InfoRow("true-peak", info.truePeakStatus)
+            InfoRow("设备最终格式", "系统未可靠报告，不能据此断言重采样或无损直通")
             InfoRow("缓冲余量", "%.1f s".format(info.bufferedMs / 1000f))
             InfoRow("音源", info.sourceLabel)
             if (loudnessGainDb != 0f) {
@@ -2914,6 +3467,7 @@ private fun InfoAction(text: String, onClick: () -> Unit) {
             .padding(horizontal = 18.wdp)
             .clip(RoundedCornerShape(12.wdp))
             .background(c.accentFill)
+            .tvFocus(shape = RoundedCornerShape(12.wdp))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }

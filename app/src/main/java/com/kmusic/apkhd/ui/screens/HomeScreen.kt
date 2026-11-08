@@ -4,16 +4,27 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import com.kmusic.apkhd.ui.tv.requestFocusSafely
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusProperties
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.style.TextOverflow
@@ -48,6 +59,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Color as UiColor
 import com.kmusic.apkhd.ui.icons.IconDownload
 import com.kmusic.apkhd.ui.icons.IconRefresh
+import com.kmusic.apkhd.ui.tv.tvFocus
+import com.kmusic.apkhd.ui.tv.tvFocusArea
+import com.kmusic.apkhd.ui.tv.tvRowFocus
+import com.kmusic.apkhd.ui.tv.tvRowItemEdge
+import com.kmusic.apkhd.ui.tv.LocalIsTv
 
 /**
  * 首页 —— 与设计稿 01 一致：
@@ -80,6 +96,13 @@ fun HomeScreen(
     onRefreshArtists: () -> Unit = {},
     playlistsRefreshing: Boolean = false,
     artistsRefreshing: Boolean = false,
+    /** v2.4.5：横向滚到末尾自动加载下一批 */
+    onLoadMorePlaylists: () -> Unit = {},
+    onLoadMoreArtists: () -> Unit = {},
+    playlistsLoadingMore: Boolean = false,
+    artistsLoadingMore: Boolean = false,
+    playlistsExhausted: Boolean = false,
+    artistsExhausted: Boolean = false,
     onMiniPlayerClick: () -> Unit,
     onTogglePlay: () -> Unit,
     modifier: Modifier = Modifier
@@ -102,11 +125,41 @@ fun HomeScreen(
         Column(
             modifier = Modifier.fillMaxSize()
         ) {
-        LazyColumn(
-            modifier = Modifier.weight(1f),
-            contentPadding = PaddingValues(start = 16.wdp, end = 16.wdp, top = 8.wdp, bottom = 142.wdp)
+        // v2.4.2：搜索框 ↓ 的落点。
+        //
+        // v2.4.1 这里靠几何搜索能走到下面的卡片，v2.4.2 去掉 `graphicsLayer` 缩放后
+        // 节点边界变了，几何搜索从搜索框（满宽 44dp 条）往下找不到落点，
+        // 遥控在搜索框上按 ↓/→ 全部无响应（实测 v2.4.1 正常、v2.4.2 卡死）。
+        // 显式指定第一张卡 —— 比赌几何搜索可靠。
+        val firstEntryFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+        // v2.4.5：首页外层纵向滚动状态。不只为滚，还要给「某区块的换一批是否还在
+        // 视口内」的判断提供 scrollY —— 跨区 ↓ 指向已滚出屏幕的 requester 时
+        // Compose 不报错、按键被静默吞掉（v2.4.4 的同一类坑）。
+        val homeScroll = rememberScrollState()
+        // v2.4.3：「换一批」与各区块首卡的焦点 requester。
+        // 必须声明在 LazyColumn **外面** —— `run {}` / `items()` 的 lambda 是
+        // `LazyListScope` 作用域，不是 @Composable，里面不能调 remember。
+        val refreshPlFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+        val plFirstFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+        val refreshArFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+        val arFirstFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+        // 排行榜首卡：继续播放卡 ↓ 直接落到这里（中间隔着区块标题，几何搜索会跳过整行）
+        val chartFirstFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+        // v2.4.4：外层从 LazyColumn 改成「一次性组合 + 滚动」的 Column。
+        // 根因：LazyColumn 会把滚出屏幕的区块整个 dispose，而 `focusProperties { up/down = fr }`
+        // 指向一个**已随区块被销毁**的 requester 时不抛异常、按键直接没反应 ——
+        // 实测从推荐歌单卡片按 ↑（目标「换一批」已滚出屏幕）焦点原地不动，
+        // 从排行榜卡片按 ↓ 则被系统几何搜索扔进左侧导航栏。
+        // 首页一共只有 8 个区块，全量组合的代价可以忽略，换来跨区块连线恒定有效。
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                // v2.4.5：滚动位置要能被「音乐人换一批是否可见」的判断读取，
+                // 否则跨区 ↓ 只能指向一个已滚出屏幕的节点（按键被吞）。
+                .verticalScroll(homeScroll)
+                .padding(start = 16.wdp, end = 16.wdp, top = 8.wdp, bottom = 142.wdp)
         ) {
-            item {
+            run {
                 Text(
                     text = greeting(),
                     color = c.t2,
@@ -133,6 +186,16 @@ fun HomeScreen(
                                 color = if (c.isDark) c.glassBorder else c.lineStrong.copy(alpha = 0.22f),
                                 shape = searchShape
                             )
+                            // ↓ 显式交给下面第一张入口卡（几何搜索在满宽条上会跳空）
+                            // ↑ 必须钉死：不写的话几何搜索会往上找到左侧导航栏，
+                            // 从首页首行按一次 ↑ 焦点就飞进 rail（实测）。
+                            .focusProperties {
+                                up = androidx.compose.ui.focus.FocusRequester.Cancel
+                                left = androidx.compose.ui.focus.FocusRequester.Cancel
+                                right = firstEntryFocus
+                                down = firstEntryFocus
+                            }
+                            .tvFocus()
                             .clickable(
                                 indication = null,
                                 interactionSource = remember { MutableInteractionSource() }
@@ -154,20 +217,34 @@ fun HomeScreen(
             }
 
             // 四个入口（宽屏 4 列一行排开，窄屏 2×2）
-            item {
+            run {
                 Column {
                     val cols = if (window.isWide) 4 else 2
-                    entries.chunked(cols).forEach { row ->
+                    // ⚠️ v2.4.3 修：`chunked()` 每次调用都返回**新的 List**，
+                    // 原来写 `row === entries.chunked(cols).first()` 是在拿两个
+                    // 不同对象比引用 —— 永远 false，`focusRequester(firstEntryFocus)`
+                    // 一个卡片都没挂上。于是搜索框的 `down = firstEntryFocus`
+                    // 指向一个「从未挂到焦点树」的 requester，按 ↓ 就是死键。
+                    // 实测：搜索框上连按 ↓×14，焦点 bbox 一次没动。
+                    // 现在先把分组算好，用下标判断首行。
+                    val entryRows = entries.chunked(cols)
+                    entryRows.forEachIndexed { rowIdx, row ->
                         Row(
                             Modifier
                                 .fillMaxWidth()
                                 .padding(bottom = 8.wdp),
                             horizontalArrangement = Arrangement.spacedBy(8.wdp)
                         ) {
-                            row.forEach { entry ->
+                            row.forEachIndexed { colIdx, entry ->
                                 QuickEntryCard(
                                     entry = entry,
-                                    modifier = Modifier.weight(1f),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .then(
+                                            if (rowIdx == 0 && colIdx == 0)
+                                                Modifier.focusRequester(firstEntryFocus)
+                                            else Modifier
+                                        ),
                                     onClick = { onEntryClick(entry) }
                                 )
                             }
@@ -181,49 +258,138 @@ fun HomeScreen(
 
             // 继续播放：把最近一首提到顶部，一键续播（比让用户去列表里找少一步）
             recentTracks.firstOrNull()?.let { last ->
-                item(key = "continue") {
+                run {
                     ContinueCard(
                         track = last,
                         recentCount = recentTracks.size,
                         onClick = { onRecentClick(last, recentTracks) },
                         onOpenList = onOpenRecentList,
-                        modifier = Modifier.padding(top = 14.wdp)
+                        modifier = Modifier
+                            // ↓ 直接落到排行榜首卡：中间隔着区块标题，几何搜索会跳过整行
+                            .focusProperties {
+                                down = when {
+                                    charts.isNotEmpty() -> chartFirstFocus
+                                    playlists.isNotEmpty() -> refreshPlFocus
+                                    else -> androidx.compose.ui.focus.FocusRequester.Cancel
+                                }
+                            }
+                            .padding(top = 14.wdp)
                     )
                 }
             }
 
             // ---- 排行榜（酷我原生，点进去必定能播） ----
             if (charts.isNotEmpty()) {
-                item {
+                run {
                     Spacer(Modifier.height(22.wdp))
                     SectionHeader(text = "排行榜", hint = "可播放")
                     Spacer(Modifier.height(12.wdp))
                 }
-                item {
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(12.wdp)) {
-                        items(charts) { sec -> ChartCard(section = sec, onClick = { onChartClick(sec) }) }
+                run {
+                    // TV：LazyRow 自身要成为一个焦点组，否则按右键会把焦点甩到别处
+                    // （侧栏 / 下一行），而不是在本行里横向移动。
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(12.wdp),
+                        modifier = Modifier.tvRowFocus()
+                    ) {
+                        itemsIndexed(charts) { i, sec ->
+                            ChartCard(
+                                section = sec,
+                                onClick = { onChartClick(sec) },
+                                modifier = Modifier.tvRowItemEdge(i, charts.size)
+                                    .then(if (LocalIsTv.current && i == 0) Modifier.focusRequester(chartFirstFocus) else Modifier)
+                                    .then(
+                                        // 榜单行的下一张不是普通几何目标：显式落到推荐歌单的
+                                        // 「换一批」，从任意榜单卡按 ↓ 都能到达。
+                                        if (LocalIsTv.current && playlists.isNotEmpty())
+                                            Modifier.focusProperties { down = refreshPlFocus }
+                                        else Modifier
+                                    )
+                            )
+                        }
                     }
                 }
             }
 
             // ---- 推荐歌单（网易云推荐位） ----
             if (playlists.isNotEmpty()) {
-                item {
+                // v2.4.3：「换一批」是个 60×24dp 的小胶囊，几何搜索从上面卡片按 ↓
+                // 永远输给下方整行卡片（面积大、水平重叠多），从卡片按 ↑ 又回到上一行卡片
+                // —— 上下都进不去。改成显式连线：换一批 ↓ = 本行首卡，首卡 ↑ = 换一批。
+                val plListState = rememberLazyListState()
+                // v2.4.5：点「换一批」→ 列表被整体替换，持焦节点消失 → Compose 把焦点
+                // 扔回左侧导航栏（实测 bounds 落到 rail 上）。刷新**结束的那一刻**
+                // 把焦点请回按钮本身，用户按 ↓ 可以接着往卡片走。
+                // ⚠️ 不能 key 在 `playlists` 上：滚到底追加时列表也会变，
+                // 那样每次加载下一批焦点都会被抢回标题栏。
+                val isTvHome = LocalIsTv.current
+                var plWasRefreshing by remember { mutableStateOf(false) }
+                LaunchedEffect(playlistsRefreshing) {
+                    if (plWasRefreshing && !playlistsRefreshing && isTvHome) {
+                        refreshPlFocus.requestFocusSafely()
+                    }
+                    plWasRefreshing = playlistsRefreshing
+                }
+                // v2.4.5：滚到末尾自动追加下一批。
+                // 判据用「最后一个可见项下标 ≥ size-3」，不是 firstVisibleItemIndex ——
+                // 后者说的是「滚到哪了」，一屏能放 5 张时它早就等于 4 了，会误触发。
+                // 只在 TV/触摸都能滚的 LazyRow 里生效，两条路径共用同一份逻辑。
+                LaunchedEffect(plListState, playlists.size, playlistsExhausted) {
+                    snapshotFlow {
+                        val info = plListState.layoutInfo
+                        (info.visibleItemsInfo.lastOrNull()?.index ?: -1) to playlists.size
+                    }.collect { (lastVisible, total) ->
+                        if (total > 0 && lastVisible >= total - 3 && !playlistsExhausted) {
+                            onLoadMorePlaylists()
+                        }
+                    }
+                }
+                run {
                     Spacer(Modifier.height(22.wdp))
                     SectionHeader(
                         text = "推荐歌单",
-                        trailing = { RefreshButton(onClick = onRefreshPlaylists, busy = playlistsRefreshing) }
+                        trailing = {
+                            RefreshButton(
+                                onClick = onRefreshPlaylists,
+                                busy = playlistsRefreshing,
+                                modifier = Modifier
+                                    .focusRequester(refreshPlFocus)
+                                    .focusProperties {
+                                        down = plFirstFocus
+                                        if (artists.isNotEmpty()) right = refreshArFocus
+                                    }
+                            )
+                        }
                     )
                     Spacer(Modifier.height(12.wdp))
                 }
-                item {
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(12.wdp)) {
-                        items(playlists) { pl ->
+                run {
+                    LazyRow(
+                        state = plListState,
+                        horizontalArrangement = Arrangement.spacedBy(12.wdp),
+                        modifier = Modifier.tvRowFocus()
+                    ) {
+                        itemsIndexed(playlists) { i, pl ->
                             PlaylistCard(
                                 playlist = pl,
                                 onClick = { onPlaylistClick(pl) },
                                 favorited = isPlaylistFavorite(pl),
-                                onLongPress = { onTogglePlaylistFavorite(pl) }
+                                onLongPress = { onTogglePlaylistFavorite(pl) },
+                                modifier = Modifier
+                                    .tvRowItemEdge(i, playlists.size)
+                                    .then(
+                                        if (LocalIsTv.current) Modifier
+                                            .then(if (i == 0) Modifier.focusRequester(plFirstFocus) else Modifier)
+                                            .focusProperties {
+                                                up = refreshPlFocus
+                                                // v2.4.5：音乐人「换一批」在小胶囊形态下几何面积太小，
+                                                // 从歌单行按 ↓ 时若指向它，Compose 有时会判定「没有可聚焦
+                                                // 目标」→ 按键被系统几何搜索接管，焦点飞进左侧导航栏。
+                                                // 直落音乐人首卡：位置确定、面积大、用户预期就是「下一行」。
+                                                if (artists.isNotEmpty()) down = arFirstFocus
+                                            }
+                                        else Modifier
+                                    )
                             )
                         }
                     }
@@ -232,17 +398,57 @@ fun HomeScreen(
 
             // ---- 音乐人 ----
             if (artists.isNotEmpty()) {
-                item {
+                val arListState = rememberLazyListState()
+                // v2.4.5：同推荐歌单，滚到末尾自动追加下一批（offset 翻页，稳定）
+                LaunchedEffect(arListState, artists.size, artistsExhausted) {
+                    snapshotFlow {
+                        val info = arListState.layoutInfo
+                        (info.visibleItemsInfo.lastOrNull()?.index ?: -1) to artists.size
+                    }.collect { (lastVisible, total) ->
+                        if (total > 0 && lastVisible >= total - 3 && !artistsExhausted) {
+                            onLoadMoreArtists()
+                        }
+                    }
+                }
+                run {
                     Spacer(Modifier.height(22.wdp))
                     SectionHeader(
                         text = "音乐人",
-                        trailing = { RefreshButton(onClick = onRefreshArtists, busy = artistsRefreshing) }
+                        trailing = {
+                            RefreshButton(
+                                onClick = onRefreshArtists,
+                                busy = artistsRefreshing,
+                                modifier = Modifier
+                                    .focusRequester(refreshArFocus)
+                                    .focusProperties {
+                                        down = arFirstFocus
+                                        up = refreshPlFocus
+                                    }
+                            )
+                        }
                     )
                     Spacer(Modifier.height(12.wdp))
                 }
-                item {
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(16.wdp)) {
-                        items(artists) { a -> ArtistCircle(artist = a, onClick = { onArtistClick(a) }) }
+                run {
+                    LazyRow(
+                        state = arListState,
+                        horizontalArrangement = Arrangement.spacedBy(16.wdp),
+                        modifier = Modifier.tvRowFocus()
+                    ) {
+                        itemsIndexed(artists) { i, a ->
+                            ArtistCircle(
+                                artist = a,
+                                onClick = { onArtistClick(a) },
+                                modifier = Modifier
+                                    .tvRowItemEdge(i, artists.size)
+                                    .then(
+                                        if (LocalIsTv.current) Modifier
+                                            .then(if (i == 0) Modifier.focusRequester(arFirstFocus) else Modifier)
+                                            .focusProperties { up = refreshArFocus }
+                                        else Modifier
+                                    )
+                            )
+                        }
                     }
                 }
             }
@@ -271,6 +477,7 @@ private fun RefreshButton(
         modifier = modifier
             .clip(RoundedCornerShape(99.wdp))
             .background(if (busy) c.s2 else c.accentDim)
+            .tvFocus(shape = RoundedCornerShape(99.wdp))
             .clickable(
                 interactionSource = interaction,
                 indication = null,
@@ -313,6 +520,7 @@ private fun QuickEntryCard(
             .height(72.wdp)
             .clip(RoundedCornerShape(c.radiusCard))
             .background(bg)
+            .tvFocus(shape = RoundedCornerShape(c.radiusCard))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -340,6 +548,7 @@ private fun ContinueCard(
             .fillMaxWidth()
             .clip(RoundedCornerShape(c.radiusCard))
             .background(Brush.linearGradient(c.cardHighlightGradient))
+            .tvFocus(shape = RoundedCornerShape(c.radiusCard))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -388,6 +597,7 @@ private fun ContinueCard(
                 fontSize = 10.wsp,
                 modifier = Modifier
                     .clip(RoundedCornerShape(6.dp))
+                    .tvFocus(shape = RoundedCornerShape(6.dp))
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -416,6 +626,7 @@ private fun TrackRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .tvFocus(fullWidth = true)
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -461,6 +672,7 @@ private fun TrackRow(
                 Modifier
                     .size(40.wdp)
                     .clip(RoundedCornerShape(12.wdp))
+                    .tvFocus(shape = RoundedCornerShape(12.wdp))
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -489,6 +701,7 @@ private fun RecommendedCard(
     Column(
         modifier = modifier
             .width(140.wdp)
+            .tvFocus()
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -559,11 +772,17 @@ internal val MoyColor6F6CC9 = UiColor(0xFF6F6CC9)
 
 /** 排行榜卡片（酷我原生，点进去必定能播） */
 @Composable
-private fun ChartCard(section: ChartSection, onClick: () -> Unit) {
+private fun ChartCard(
+    section: ChartSection,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     val c = moyinColors()
     Column(
-        modifier = Modifier
+        modifier = modifier
             .width(150.wdp)
+            // v2.4.5：高亮只裁到封面（理由见 PlaylistCard）
+            .tvFocusArea(height = 150.wdp, cornerRadius = coverRadiusOf(c))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -612,12 +831,17 @@ private fun PlaylistCard(
     /** 已收藏时右上角显示心形角标。null = 不显示收藏状态（老调用点兼容） */
     favorited: Boolean? = null,
     /** 长按收藏 / 取消收藏。null = 不支持长按 */
-    onLongPress: (() -> Unit)? = null
+    onLongPress: (() -> Unit)? = null,
+    modifier: Modifier = Modifier
 ) {
     val c = moyinColors()
     Column(
-        modifier = Modifier
+        modifier = modifier
             .width(132.wdp)
+            // v2.4.5：高亮**只裁到封面这一块**，圆角与封面完全一致。
+            // 焦点节点仍然是整列（点击/长按/连线全不动），只是绘制范围收窄 ——
+            // 旧版按整列外接矩形上色，封面四角露底色、下方标题区被染色。
+            .tvFocusArea(height = 132.wdp, cornerRadius = coverRadiusOf(c))
             .combinedClickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
@@ -670,11 +894,18 @@ private fun PlaylistCard(
 
 /** 音乐人（圆形头像） */
 @Composable
-private fun ArtistCircle(artist: ArtistBrief, onClick: () -> Unit) {
+private fun ArtistCircle(
+    artist: ArtistBrief,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
     val c = moyinColors()
     Column(
-        modifier = Modifier
+        modifier = modifier
             .width(76.wdp)
+            // v2.4.5：高亮只裁到头像（正圆）。整列只有 76×68+文字，
+            // 裁到 68dp 高度后高亮就是一个与头像完全重合的圆。
+            .tvFocusArea(height = 68.wdp, cornerRadius = 99.wdp)
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }

@@ -37,6 +37,28 @@ object FxChain {
     const val INPUT_GAIN_MIN_DB = -24f
     const val INPUT_GAIN_MAX_DB = 12f
 
+    var truePeakEnabled: Boolean = false
+        private set
+    var truePeakCeilingDb: Float = -1f
+        private set
+    var devicePreGainDb: Float = 0f
+        private set
+
+    fun configureTruePeak(enabled: Boolean, ceilingDb: Float = -1f) {
+        val ceiling = TruePeakLimiter.sanitizeCeiling(ceilingDb)
+        if (truePeakEnabled == enabled && truePeakCeilingDb == ceiling) return
+        truePeakEnabled = enabled
+        truePeakCeilingDb = ceiling
+        push()
+    }
+
+    fun configureDevicePreGain(db: Float) {
+        val next = if (db.isFinite()) db.coerceIn(-24f, 0f) else 0f
+        if (devicePreGainDb == next) return
+        devicePreGainDb = next
+        push()
+    }
+
     // ── 用户配置（单一真相） ──
     /** 均衡器开关 */
     var enabled: Boolean = false
@@ -68,6 +90,11 @@ object FxChain {
     /** 省电播放（offload）—— 直通 DSP，处理器收不到 PCM */
     @Volatile
     var offloadActive: Boolean = false
+        private set
+
+    /** 纯净 PCM 不挂 EQ；这是独立偏好，不代表硬件 offload 生效。 */
+    @Volatile
+    var pureAudioModeActive: Boolean = false
         private set
 
     /**
@@ -154,8 +181,11 @@ object FxChain {
     fun inputGainDb(): Float {
         val loud = loudnessGain / 100f
         val peak = lastHeadroomDb
-        return (loud - peak).coerceIn(INPUT_GAIN_MIN_DB, INPUT_GAIN_MAX_DB)
+        return (loud - peak + devicePreGainDb).coerceIn(INPUT_GAIN_MIN_DB, INPUT_GAIN_MAX_DB)
     }
+
+    /** 实际旁路原因由运行态报告；三种条件仅合成透明通过。 */
+    internal fun shouldBypass(dsd: Boolean, offload: Boolean, pure: Boolean): Boolean = dsd || offload || pure
 
     // ── 用户动作 ──
 
@@ -254,6 +284,12 @@ object FxChain {
         push()
     }
 
+    fun setPureAudioMode(on: Boolean) {
+        if (pureAudioModeActive == on) return
+        pureAudioModeActive = on
+        push()
+    }
+
     /**
      * 老版本存的 `eq_preset` 是**设备预设下标**（0..9），现在换成了内置表。
      *
@@ -290,8 +326,13 @@ object FxChain {
     /** 释放：进程退出时清空处理器参数（不影响别的 App，也不占任何系统资源） */
     fun release() {
         bypassedByDsd = false
+        offloadActive = false
+        pureAudioModeActive = false
         lastHeadroomDb = 0f
-        EqProcessor.instance.applyParams(false, IntArray(EqBands.COUNT), 0, 0f)
+        truePeakEnabled = false
+        truePeakCeilingDb = -1f
+        devicePreGainDb = 0f
+        EqProcessor.instance.applyParams(false, IntArray(EqBands.COUNT), 0, 0f, bypassed = false, truePeakEnabled = false)
         version++
     }
 
@@ -312,12 +353,14 @@ object FxChain {
         val fs = proc.currentSampleRate.toFloat().takeIf { it > 0f } ?: 48_000f
         lastHeadroomDb = Biquad.peakBoostDb(gains, bassStrength, fs, EqProcessor.BASS_SHELF_HZ, EqProcessor.BASS_MAX_DB)
         val preGain = inputGainDb()
-        proc.isBypassed = bypassedByDsd || offloadActive
         proc.applyParams(
             enabled = enabled,
             gainsMb = gains,
             bassStrength = bassStrength,
-            preGainDb = preGain
+            preGainDb = preGain,
+            bypassed = shouldBypass(bypassedByDsd, offloadActive, pureAudioModeActive),
+            truePeakEnabled = truePeakEnabled,
+            truePeakCeilingDb = truePeakCeilingDb
         )
         version++
         DiagLog.log(

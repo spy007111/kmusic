@@ -156,27 +156,21 @@ class DsdDffTest {
         }
 
 
-        // Goertzel：找 1kHz 的幅度
-        val target = 1000.0
-        val sr = 44100.0
-        val k = (target * frames / sr).toInt()
-        val omega = 2 * PI * k / frames
-        val coeff = 2 * cos(omega)
-        var s1 = 0.0
-        var s2 = 0.0
-        for (i in 0 until frames) {
-            val s0 = coeff * s1 - s2 + left[i]
-            s2 = s1
-            s1 = s0
+        // 取稳态半秒（恰为500个1k周期）；不能把目标频率向下取整到FFT bin。
+        val measuredFrames = 22050
+        assertTrue(frames > measuredFrames + 1000)
+        val omega = 2 * PI * 1000.0 / 44100.0
+        var real = 0.0
+        var imag = 0.0
+        for (i in 0 until measuredFrames) {
+            val sample = left[frames - measuredFrames + i]
+            real += sample * cos(omega * i)
+            imag -= sample * sin(omega * i)
         }
-        // Goertzel 的输出功率：|X(k)|^2 = s1^2 + s2^2 - coeff*s1*s2
-        val power = s1 * s1 + s2 * s2 - coeff * s1 * s2
-        // 幅度 = 2*sqrt(power) / N
-        val amp = 2.0 * kotlin.math.sqrt(kotlin.math.abs(power)) / frames
+        val amp = 2.0 * kotlin.math.hypot(real, imag) / measuredFrames
         val db = 20 * kotlin.math.log10(amp.coerceAtLeast(1e-12))
-
-        // 源是 -6 dBFS 的 1kHz，抽取后应接近（-12..0 dBFS 区间）
-        assertTrue("1kHz 幅度异常：$db dB", db > -12.0 && db < 1.0)
+        // 源为0.5幅度；排除起始瞬态和频率格点泄漏后应约−6.02dBFS。
+        assertTrue("1kHz 幅度异常：$db dB", db in -6.4..-5.7)
     }
 
     @Test

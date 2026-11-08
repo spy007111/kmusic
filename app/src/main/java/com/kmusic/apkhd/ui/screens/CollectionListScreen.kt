@@ -33,6 +33,7 @@ import com.kmusic.apkhd.ui.icons.IconBack
 import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /**
  * 曲库列表页 —— 专辑 / 歌手 / 歌单共用。
@@ -65,6 +66,7 @@ fun CollectionListScreen(
             Box(
                 Modifier
                     .size(44.wdp)
+                    .tvFocus()
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -118,6 +120,7 @@ private fun CollectionRow(item: CollectionItem, onClick: () -> Unit) {
     Row(
         Modifier
             .fillMaxWidth()
+            .tvFocus(fullWidth = true)
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }

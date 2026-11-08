@@ -209,3 +209,145 @@ object Biquad {
         return peak.coerceAtLeast(0f)
     }
 }
+
+
+/** 单次发布的不可变配置；数组只在构造时复制，不暴露可写引用。 */
+internal class EqParameters private constructor(
+    val enabled: Boolean,
+    private val levels: IntArray,
+    val bassStrength: Int,
+    val preGainDb: Float,
+    val bypassed: Boolean,
+    val truePeakEnabled: Boolean,
+    val truePeakCeilingDb: Float
+) {
+    val working: Boolean get() = !bypassed &&
+        ((enabled && levels.any { it != 0 }) || bassStrength > 0 || kotlin.math.abs(preGainDb) > 0.001f)
+
+    fun gains(): IntArray = levels.copyOf()
+    fun effectiveGain(band: Int): Int = if (enabled) levels[band] else 0
+
+    fun sameFilters(other: EqParameters): Boolean = bassStrength == other.bassStrength &&
+        (0 until EqBands.COUNT).all { effectiveGain(it) == other.effectiveGain(it) }
+
+    fun sameValues(other: EqParameters): Boolean = enabled == other.enabled &&
+        levels.contentEquals(other.levels) && bassStrength == other.bassStrength &&
+        preGainDb == other.preGainDb && bypassed == other.bypassed &&
+        truePeakEnabled == other.truePeakEnabled && truePeakCeilingDb == other.truePeakCeilingDb
+
+    fun updated(
+        enabled: Boolean = this.enabled,
+        gainsMb: IntArray = levels,
+        bassStrength: Int = this.bassStrength,
+        preGainDb: Float = this.preGainDb,
+        bypassed: Boolean = this.bypassed,
+        truePeakEnabled: Boolean = this.truePeakEnabled,
+        truePeakCeilingDb: Float = this.truePeakCeilingDb
+    ): EqParameters = create(enabled, gainsMb, bassStrength, preGainDb, bypassed, truePeakEnabled, truePeakCeilingDb)
+
+    companion object {
+        fun create(
+            enabled: Boolean = false,
+            gainsMb: IntArray = IntArray(EqBands.COUNT),
+            bassStrength: Int = 0,
+            preGainDb: Float = 0f,
+            bypassed: Boolean = false,
+            truePeakEnabled: Boolean = false,
+            truePeakCeilingDb: Float = -1f
+        ): EqParameters = EqParameters(
+            enabled,
+            EqBands.normalize(gainsMb).map { it.coerceIn(-1500, 1500) }.toIntArray(),
+            bassStrength.coerceIn(0, 1000),
+            if (preGainDb.isFinite()) preGainDb.coerceIn(-24f, 24f) else 0f,
+            bypassed,
+            truePeakEnabled,
+            TruePeakLimiter.sanitizeCeiling(truePeakCeilingDb)
+        )
+    }
+}
+
+internal class GainRamp(initial: Float = 1f) {
+    var value: Float = initial
+        private set
+    private var target = initial
+    private var remaining = 0
+    val moving: Boolean get() = remaining > 0
+
+    fun setTarget(next: Float, frames: Int) {
+        if (next == target) return
+        target = next
+        remaining = frames.coerceAtLeast(1)
+    }
+
+    fun next(): Float {
+        if (remaining > 0) {
+            value += (target - value) / remaining
+            remaining--
+            if (remaining == 0) value = target
+        }
+        return value
+    }
+}
+
+/** 音频线程独占。固定稳定系数的两条链混合输出，绝不插值 IIR 系数。 */
+internal class EqDspTransition(private val sampleRate: Int, private val channels: Int) {
+    private val transitionFrames = (sampleRate / 100).coerceAtLeast(1) // 10ms
+    private var applied = EqParameters.create()
+    private var active = Branch(applied)
+    private var fadingFrom: Branch? = null
+    private var fadePosition = 0
+    private var mix = 1f
+    private var frameGain = 1f
+    private var oldFrameGain = 1f
+
+    val processing: Boolean get() = applied.working || fadingFrom != null || active.gain.moving
+    val transitioning: Boolean get() = fadingFrom != null
+
+    fun prepare(next: EqParameters) {
+        if (fadingFrom != null || applied.sameValues(next)) return
+        if (applied.sameFilters(next)) {
+            active.gain.setTarget(10f.pow(next.preGainDb / 20f), transitionFrames)
+        } else {
+            // 新链从零状态开始，旧链保留状态；完整输出（含各自 headroom）交叉淡化。
+            fadingFrom = active
+            active = Branch(next)
+            fadePosition = 0
+        }
+        applied = next
+    }
+
+    fun beginFrame() {
+        mix = if (fadingFrom != null) (++fadePosition).toFloat() / transitionFrames else 1f
+        frameGain = active.gain.next()
+        oldFrameGain = fadingFrom?.gain?.next() ?: 1f
+    }
+
+    fun process(channel: Int, input: Float): Float {
+        val wet = active.process(channel, input) * frameGain
+        val old = fadingFrom?.process(channel, input)?.times(oldFrameGain) ?: return wet
+        return old * (1f - mix) + wet * mix
+    }
+
+    fun endFrame() {
+        if (fadingFrom != null && fadePosition >= transitionFrames) fadingFrom = null
+    }
+
+    private inner class Branch(params: EqParameters) {
+        val gain = GainRamp(10f.pow(params.preGainDb / 20f))
+        private val coeffs = Array(EqBands.COUNT) { b ->
+            Biquad.peaking(EqBands.FREQS[b].toFloat(), params.effectiveGain(b) / 100f, 1.4142135f, sampleRate.toFloat())
+        }
+        private val state = Array(EqBands.COUNT) { Array(channels) { FloatArray(2) } }
+        private val shelf = Biquad.lowShelf(110f, params.bassStrength / 1000f * 9f, 0.8f, sampleRate.toFloat())
+        private val shelfState = Array(channels) { FloatArray(2) }
+
+        fun process(channel: Int, input: Float): Float {
+            var x = input
+            for (b in coeffs.indices) {
+                if (coeffs[b] !== Biquad.IDENTITY) x = Biquad.step(coeffs[b], state[b][channel], x)
+            }
+            if (shelf !== Biquad.IDENTITY) x = Biquad.step(shelf, shelfState[channel], x)
+            return x
+        }
+    }
+}

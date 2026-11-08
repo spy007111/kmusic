@@ -20,7 +20,7 @@ import java.nio.ByteOrder
  */
 object PcmDecoder {
 
-    data class Info(val sampleRate: Int, val channels: Int)
+    data class Info(val sampleRate: Int, val channels: Int, val reachedEndOfStream: Boolean = false)
 
     /**
      * @param startUs  从哪开始（seek 到最近的同步点）
@@ -80,6 +80,7 @@ object PcmDecoder {
             val info = MediaCodec.BufferInfo()
             var inputDone = false
             var outputDone = false
+            var reachedEndOfStream = false
             var pcmEncoding = runCatching { format.getInteger(MediaFormat.KEY_PCM_ENCODING) }
                 .getOrDefault(android.media.AudioFormat.ENCODING_PCM_16BIT)
             val deadline = if (maxUs == Long.MAX_VALUE) Long.MAX_VALUE else startUs + maxUs
@@ -108,7 +109,10 @@ object PcmDecoder {
                         onPcm(floats, floats.size, channels)
                     }
                     codec.releaseOutputBuffer(outIdx, false)
-                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputDone = true
+                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        reachedEndOfStream = true
+                        outputDone = true
+                    }
                     // PTS 用不上时（有些容器不给）只靠 maxUs 兜底；这里按采样数判断更稳
                     if (deadline != Long.MAX_VALUE && info.presentationTimeUs > deadline) outputDone = true
                 } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
@@ -117,7 +121,7 @@ object PcmDecoder {
                     }.getOrDefault(pcmEncoding)
                 }
             }
-            return Info(sampleRate, channels)
+            return Info(sampleRate, channels, reachedEndOfStream)
         } finally {
             runCatching { codec?.stop() }
             runCatching { codec?.release() }

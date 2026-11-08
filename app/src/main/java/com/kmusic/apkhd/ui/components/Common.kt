@@ -57,6 +57,7 @@ import com.kmusic.apkhd.ui.theme.SideRailWidth
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
 import com.kmusic.apkhd.ui.theme.wspSp
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /**
  * 按压反馈：scale(0.97) + 100ms。
@@ -72,6 +73,7 @@ fun Modifier.pressScale(
     val scale by animateFloatAsState(if (pressed) 0.97f else 1f, label = "pressScale")
     return this
         .scale(scale)
+        .tvFocus()
         .clickable(
             enabled = enabled,
             interactionSource = interaction,
@@ -227,6 +229,7 @@ fun MoyinTabBar(
                 Column(
                     modifier = Modifier
                         .weight(1f)
+                        .tvFocus()
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -318,6 +321,7 @@ fun MoyinSideRail(
                         .padding(horizontal = 8.wdp, vertical = 2.wdp)
                         .clip(RoundedCornerShape(c.radiusCard))
                         .background(if (on) c.glass else Color.Transparent)
+                        .tvFocus(shape = RoundedCornerShape(c.radiusCard))
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -398,6 +402,7 @@ fun IconCircleButton(
                 if (background != null) Modifier.background(background)
                 else Modifier
             )
+            .tvFocus()
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -468,6 +473,7 @@ fun MoyinSwitch(
             .height(26.wdp)
             .clip(RoundedCornerShape(99.dp))
             .background(if (checked) c.accent else Color(0x24000000).let { if (c.isDark) Color(0x24FFFFFF) else it })
+            .tvFocus(shape = RoundedCornerShape(99.dp))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }

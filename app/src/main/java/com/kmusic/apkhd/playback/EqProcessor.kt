@@ -7,7 +7,6 @@ import androidx.media3.common.util.UnstableApi
 import com.kmusic.apkhd.data.DiagLog
 import java.nio.ByteBuffer
 import kotlin.math.abs
-import kotlin.math.pow
 import kotlin.math.sign
 
 /**
@@ -73,50 +72,23 @@ class EqProcessor : BaseAudioProcessor() {
         const val LEVEL_MAX = 1_500
     }
 
-    // ── 参数：界面线程写、音频线程读 ──
     @Volatile
-    private var enabled: Boolean = false
+    private var params = EqParameters.create()
 
-    @Volatile
-    private var bypassed: Boolean = false
-
-    @Volatile
-    private var gainsMb: IntArray = IntArray(EqBands.COUNT)
-
-    @Volatile
-    private var bassStrength: Int = 0
-
-    @Volatile
-    private var preGainDb: Float = 0f
-
-    /** 参数版本号：变了才重算系数 */
-    @Volatile
-    private var paramVersion: Int = 0
-
-    /** 上一次「输出接近满幅」告警的时刻（毫秒），3 秒限流 */
     private var lastClipWarnMs: Long = 0
 
-    private var appliedVersion: Int = -1
-
-    // ── 运行态 ──
     @Volatile
     private var sampleRate: Int = 0
-
     @Volatile
     private var channelCount: Int = 0
-
     private var encoding: Int = C.ENCODING_INVALID
-
-    /** [band][channel] → FloatArray(2) 状态（转置直接 II 型）—— 交给 [Biquad.step] 原地更新 */
-    private var zState = Array(EqBands.COUNT) { arrayOf(FloatArray(2)) }
-
-    /** 每段系数，整体替换（不原地改，避免音频线程读到半套系数） */
-    private var coeffs = Array(EqBands.COUNT) { Biquad.IDENTITY }
-
-    private var shelf = Biquad.IDENTITY
-
-    /** 低音搁架：[channel] → FloatArray(2) 状态 */
-    private var shelfState = arrayOf(FloatArray(2))
+    private var dsp: EqDspTransition? = null
+    private var limiter: TruePeakLimiter? = null
+    private var frameScratch = FloatArray(0)
+    private var limitedScratch = FloatArray(0)
+    @Volatile private var limiterRunning = false
+    val currentTruePeakActive: Boolean get() = limiterRunning && params.truePeakEnabled && !params.bypassed
+    val currentTruePeakLatencyFrames: Int get() = if (limiterRunning) maxOf((sampleRate * 0.004).toInt(), 24) else 0
 
     // ── 对外只读状态（界面用它解释「为什么没变化」） ──
 
@@ -135,83 +107,48 @@ class EqProcessor : BaseAudioProcessor() {
 
     /** DSD / 省电播放时整条处理器透明通过 */
     var isBypassed: Boolean
-        get() = bypassed
-        set(on) {
-            if (bypassed == on) return
-            bypassed = on
-            paramVersion++
-        }
+        get() = params.bypassed
+        @Synchronized set(on) { publish(params.updated(bypassed = on)) }
 
-    /**
-     * 此刻是否有任何一项在改声音。
-     *
-     * 曲线全零 + 无低音 + 无前级 = 恒等变换，[queueInput] 走透传。
-     * ⚠️ 这里返回 false 时**不能**让 [isActive] 变 false —— 那要重配管线，
-     * 会变成「关掉效果要等切歌才安静」。
-     */
-    val working: Boolean
-        get() = !bypassed && (
-            (enabled && gainsMb.any { it != 0 }) ||
-                bassStrength > 0 ||
-                abs(preGainDb) > 0.001f
-            )
+    val working: Boolean get() = params.working || (params.truePeakEnabled && !params.bypassed)
 
-    /**
-     * 让给 EQ 的前级余量（dB，正数）。
-     *
-     * 用解析幅频响应算整条曲线的峰值，而不是取十段里的最大值 ——
-     * 相邻段在中间频率会叠加，取最大值会低估（见 [Biquad.peakBoostDb]）。
-     */
+    /** 与 FxChain 相同的解析曲线余量；读取单个完整配置。 */
     fun headroomDb(): Float {
-        if (!working) return 0f
+        val p = params
+        if (!p.working) return 0f
         val fs = sampleRate.toFloat().takeIf { it > 0f } ?: 48_000f
-        return Biquad.peakBoostDb(gainsMb, bassStrength, fs, BASS_SHELF_HZ, BASS_MAX_DB, Q)
+        val gains = if (p.enabled) p.gains() else IntArray(EqBands.COUNT)
+        return Biquad.peakBoostDb(gains, p.bassStrength, fs, BASS_SHELF_HZ, BASS_MAX_DB, Q)
     }
 
-    // ── 参数写入 ──
+    @Synchronized
+    fun setEnabled(on: Boolean) { publish(params.updated(enabled = on)) }
 
-    fun setEnabled(on: Boolean) {
-        if (enabled == on) return
-        enabled = on
-        paramVersion++
-    }
+    @Synchronized
+    fun setGains(milliBel: IntArray) { publish(params.updated(gainsMb = milliBel)) }
 
-    /** 写入十段增益（mB）。长度不对会按对数轴插值（见 [EqBands.normalize]） */
-    fun setGains(milliBel: IntArray) {
-        val next = EqBands.normalize(milliBel)
-        if (next.contentEquals(gainsMb)) return
-        gainsMb = next
-        paramVersion++
-    }
+    @Synchronized
+    fun setBass(strength: Int) { publish(params.updated(bassStrength = strength)) }
 
-    /** 低音增强强度 0..1000（0 = 关） */
-    fun setBass(strength: Int) {
-        val v = strength.coerceIn(0, 1_000)
-        if (v == bassStrength) return
-        bassStrength = v
-        paramVersion++
-    }
+    @Synchronized
+    fun setPreGainDb(db: Float) { publish(params.updated(preGainDb = db)) }
 
-    /** 前级增益（dB）。响度 + 让给 EQ 的余量已由调用方算好 */
-    fun setPreGainDb(db: Float) {
-        val v = db.coerceIn(-24f, 24f)
-        if (abs(v - preGainDb) < 0.001f) return
-        preGainDb = v
-        paramVersion++
-    }
-
-    /** 一次性写入全部参数（避免连发几次 paramVersion 各重算一遍系数） */
+    /** 配置与旁路一起原子发布；音频线程每个块只读取一次。 */
+    @Synchronized
     fun applyParams(
         enabled: Boolean,
         gainsMb: IntArray,
         bassStrength: Int,
-        preGainDb: Float
+        preGainDb: Float,
+        bypassed: Boolean = params.bypassed,
+        truePeakEnabled: Boolean = params.truePeakEnabled,
+        truePeakCeilingDb: Float = params.truePeakCeilingDb
     ) {
-        this.enabled = enabled
-        this.gainsMb = EqBands.normalize(gainsMb)
-        this.bassStrength = bassStrength.coerceIn(0, 1_000)
-        this.preGainDb = preGainDb.coerceIn(-24f, 24f)
-        paramVersion++
+        publish(EqParameters.create(enabled, gainsMb, bassStrength, preGainDb, bypassed, truePeakEnabled, truePeakCeilingDb))
+    }
+
+    private fun publish(next: EqParameters) {
+        if (!params.sameValues(next)) params = next
     }
 
     // ── AudioProcessor ──
@@ -233,9 +170,7 @@ class EqProcessor : BaseAudioProcessor() {
         sampleRate = inputAudioFormat.sampleRate
         channelCount = inputAudioFormat.channelCount
         encoding = inputAudioFormat.encoding
-        zState = Array(EqBands.COUNT) { Array(channelCount) { FloatArray(2) } }
-        shelfState = Array(channelCount) { FloatArray(2) }
-        appliedVersion = -1
+        clearState()
         DiagLog.log(
             "EQ",
             "十段处理器接入：${sampleRate}Hz ${channelCount}ch ${encodingName(encoding)}"
@@ -247,14 +182,16 @@ class EqProcessor : BaseAudioProcessor() {
 
     override fun onFlush() {
         clearState()
-        appliedVersion = -1
     }
 
     override fun onReset() {
-        clearState()
+        dsp = null
+        limiter = null
+        limiterRunning = false
+        frameScratch = FloatArray(0)
+        limitedScratch = FloatArray(0)
         sampleRate = 0
         channelCount = 0
-        appliedVersion = -1
         onFormatChanged?.invoke(0)
     }
 
@@ -269,107 +206,80 @@ class EqProcessor : BaseAudioProcessor() {
 
     override fun queueInput(inputBuffer: ByteBuffer) {
         val size = inputBuffer.remaining()
+        if (size <= 0) return
         val bps = bytesPerSample(encoding)
         val frameSize = bps * channelCount
-        if (size <= 0) return
-
-        val passthrough = bypassed || !working || sampleRate <= 0 ||
-            channelCount <= 0 || frameSize <= 0 || size < frameSize
-
-        if (passthrough) {
+        val p = params
+        val valid = sampleRate > 0 && channelCount > 0 && frameSize > 0
+        if (!valid) {
             val out = replaceOutputBuffer(size)
-            out.put(inputBuffer)
-            out.flip()
-            inputBuffer.position(inputBuffer.limit())
+            out.put(inputBuffer).flip()
             return
         }
-
-        refreshCoefficientsIfNeeded()
-
-        val out = replaceOutputBuffer(size)
+        // Retain a started delay line until flush: toggling a protection cannot lose buffered frames.
+        // When a forced bypass arrives, delayed data drains in order before new byte-exact dry input.
+        if (p.bypassed) dsp = null else {
+            if (dsp == null) dsp = EqDspTransition(sampleRate, channelCount)
+            dsp?.prepare(p)
+        }
+        if (p.truePeakEnabled && !p.bypassed && limiter == null) {
+            limiter = TruePeakLimiter(sampleRate, channelCount)
+            limiterRunning = true
+        }
+        val protection = limiter
+        protection?.configure(p.truePeakEnabled && !p.bypassed, p.truePeakCeilingDb)
+        val core = dsp
+        if (protection == null && (p.bypassed || core?.processing != true)) {
+            val out = replaceOutputBuffer(size)
+            out.put(inputBuffer).flip()
+            return
+        }
         val frames = size / frameSize
         val start = inputBuffer.position()
-        val gain = 10f.pow(preGainDb / 20f)
-        val bassOn = bassStrength > 0
-        val bands = EqBands.COUNT
-        val ch = channelCount
-        val cf = coeffs
-        val sh = shelf
-
-        var base = start
-        var inPeak = 0f
-        var outPeak = 0f
-        var clipped = 0
+        val tail = size % frameSize
+        val out = replaceOutputBuffer(size)
         for (f in 0 until frames) {
-            for (c in 0 until ch) {
-                var x = readSample(inputBuffer, base + c * bps)
-                val ax = abs(x)
-                if (ax > inPeak) inPeak = ax
-                var b = 0
-                while (b < bands) {
-                    x = Biquad.step(cf[b], zState[b][c], x)
-                    b++
+            core?.beginFrame()
+            for (c in 0 until channelCount) {
+                val raw = readSample(inputBuffer, start + f * frameSize + c * bps)
+                var x = if (p.bypassed) raw else core?.process(c, raw) ?: raw
+                if (protection == null || !p.truePeakEnabled || p.bypassed) {
+                    if (!p.bypassed && (x > SOFT_KNEE || x < -SOFT_KNEE)) x = softClip(x)
+                } else if (!x.isFinite()) {
+                    x = 0f // abnormal fallback only; no normal softclip after peak protection
                 }
-                if (bassOn) {
-                    x = Biquad.step(sh, shelfState[c], x)
-                }
-                x *= gain
-                if (x > SOFT_KNEE || x < -SOFT_KNEE) {
-                    x = softClip(x)
-                    clipped++
-                }
-                val ay = abs(x)
-                if (ay > outPeak) outPeak = ay
-                writeSample(out, x)
+                frameScratch[c] = x
             }
-            base += frameSize
-        }
-        // 低频端自检：正常音乐每块（约 4~20ms）的峰值不该长期贴着 1.0。
-        // 曾经因 b2/a1 用反而在高频端放大到 +320dB，全靠限幅器压回满幅 ——
-        // 听感是「一片杂音」，但界面一切正常、没有任何报错。这条日志就是那种
-        // 「界面上看不出、耳朵一听就废」的故障的抓手：outPeak 长期 > 0.99 且
-        // clipped 占样本数很大比例，就说明链上有东西在疯狂放大。
-        val total = frames * ch
-        if (total > 0 && (outPeak > 0.995f || clipped > total / 4)) {
-            val now = android.os.SystemClock.elapsedRealtime()
-            if (now - lastClipWarnMs > 3_000) {
-                lastClipWarnMs = now
-                DiagLog.log(
-                    "EQ",
-                    "输出接近满幅：in=${"%.3f".format(inPeak)} out=${"%.3f".format(outPeak)} " +
-                        "限幅=${clipped * 100 / total}% 前级=${"%.1f".format(preGainDb)}dB " +
-                        "曲线=${gainsMb.joinToString(",")}"
-                )
+            core?.endFrame()
+            if (protection == null) {
+                for (c in 0 until channelCount) writeSample(out, frameScratch[c])
+            } else if (protection.push(frameScratch, limitedScratch)) {
+                for (c in 0 until channelCount) writeSample(out, limitedScratch[c])
             }
         }
-        // 不足一帧的尾巴原样带过去（正常不会发生，防御性）
-        val tail = size - frames * frameSize
-        for (i in 0 until tail) out.put(inputBuffer.get(start + frames * frameSize + i))
+        // Partial PCM frames are not expected by Media3. Preserve their bytes on the undelayed path.
+        if (protection == null) for (i in 0 until tail) out.put(inputBuffer.get(start + frames * frameSize + i))
         out.flip()
-        // ⚠️ 必须把输入缓冲「消费掉」：管线靠 position 前进来判断还有没有数据，
-        // 不前进就会把同一个 buffer 再喂一遍 —— 声音叠两遍，还越叠越多。
-        inputBuffer.position(inputBuffer.limit())
+        inputBuffer.position(start + frames * frameSize + if (protection == null) tail else 0)
+    }
+
+    override fun onQueueEndOfStream() {
+        val protection = limiter ?: return
+        val out = replaceOutputBuffer(protection.pendingFrames * channelCount * bytesPerSample(encoding))
+        while (protection.drain(limitedScratch)) {
+            for (c in 0 until channelCount) writeSample(out, limitedScratch[c])
+        }
+        out.flip()
     }
 
     // ── 内部 ──
 
     private fun clearState() {
-        zState.forEach { perCh -> perCh.forEach { it.fill(0f) } }
-        shelfState.forEach { it.fill(0f) }
-    }
-
-    private fun refreshCoefficientsIfNeeded() {
-        val v = paramVersion
-        if (v == appliedVersion) return
-        appliedVersion = v
-        val fs = sampleRate.toFloat()
-        val next = Array(EqBands.COUNT) { b ->
-            val db = if (enabled) gainsMb.getOrElse(b) { 0 } / 100f else 0f
-            Biquad.peaking(EqBands.FREQS[b].toFloat(), db, Q, fs)
-        }
-        coeffs = next
-        val bassDb = if (bassStrength > 0) bassStrength / 1_000f * BASS_MAX_DB else 0f
-        shelf = Biquad.lowShelf(BASS_SHELF_HZ, bassDb, 0.8f, fs)
+        dsp = if (sampleRate > 0 && channelCount > 0) EqDspTransition(sampleRate, channelCount) else null
+        limiter = null
+        limiterRunning = false
+        frameScratch = FloatArray(channelCount.coerceAtLeast(0))
+        limitedScratch = FloatArray(channelCount.coerceAtLeast(0))
     }
 
     /**

@@ -38,6 +38,7 @@ import com.kmusic.apkhd.ui.icons.IconMusicNote
 import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /**
  * WebDAV 浏览页。
@@ -88,6 +89,7 @@ fun WebDavScreen(
                 size = 40.wdp,
                 modifier = Modifier
                     .clip(RoundedCornerShape(99.dp))
+                    .tvFocus(shape = RoundedCornerShape(99.dp))
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -111,6 +113,7 @@ fun WebDavScreen(
                 fontSize = 12.wsp,
                 modifier = Modifier
                     .clip(RoundedCornerShape(99.dp))
+                    .tvFocus(shape = RoundedCornerShape(99.dp))
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -189,6 +192,7 @@ private fun DavRow(entry: DavEntry, onClick: () -> Unit, onDownload: () -> Unit)
     Row(
         Modifier
             .fillMaxWidth()
+            .tvFocus(fullWidth = true)
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -239,6 +243,7 @@ private fun DavRow(entry: DavEntry, onClick: () -> Unit, onDownload: () -> Unit)
                 size = 18.wdp,
                 modifier = Modifier
                     .clip(RoundedCornerShape(99.dp))
+                    .tvFocus(shape = RoundedCornerShape(99.dp))
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -259,6 +264,7 @@ private fun PillButton(text: String, filled: Boolean = false, onClick: () -> Uni
         modifier = Modifier
             .clip(RoundedCornerShape(99.wdp))
             .background(if (filled) c.accentFill else c.s2)
+            .tvFocus(shape = RoundedCornerShape(99.wdp))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }

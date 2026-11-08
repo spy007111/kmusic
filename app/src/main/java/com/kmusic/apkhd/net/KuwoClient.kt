@@ -68,6 +68,44 @@ class KuwoClient(
         const val BR_HIRES = "2000kflac"      // 无损 FLAC
         const val BR_HIGH = "320kmp3"         // 极高品 MP3
         const val BR_STANDARD = "128kmp3"     // 标准
+
+        // ── 实际音质分级（v2.4.10）──
+        //
+        // **必须按响应里的 `format` + `bitrate` 判，不能按请求的参数判。**
+        // 实测：请求 `20900kmflac`，酷我会老老实实返回
+        // `{"format":"mp3","bitrate":128,"duration":211}` —— 即一首完整的 128k mp3。
+        // 它既不报错、也不是 11 秒试听片段，只看「成功/失败」根本发现不了，
+        // 结果是界面挂「臻品母带」、耳朵听到 128k。
+        const val RANK_NONE = 0     // 拿不到 / 未知
+        const val RANK_LOSSY = 1    // mp3/aac/ogg，且 < 256kbps
+        const val RANK_HIGH = 2     // ≥256kbps 有损（320k）
+        const val RANK_FLAC = 3     // 无损（flac）
+        const val RANK_MASTER = 4   // 母带（mflac / mgg）
+
+        /** 响应里的格式 + 码率 → 分级。未知格式一律 RANK_NONE，宁可当没拿到。 */
+        fun rankOf(format: String?, kbps: Int): Int {
+            val f = format?.lowercase()?.trim().orEmpty()
+            return when {
+                f.startsWith("mflac") || f.startsWith("mgg") -> RANK_MASTER
+                f == "flac" || f == "ape" -> RANK_FLAC
+                f == "mp3" || f == "aac" || f == "ogg" || f == "opus" || f == "wma" ->
+                    if (kbps >= 256) RANK_HIGH else RANK_LOSSY
+                else -> RANK_NONE
+            }
+        }
+
+        /** 分级 → 界面标签。与 [rankOf] 成对使用，保证「标签 = 实际」 */
+        fun labelOf(format: String?, kbps: Int): String? {
+            val f = format?.lowercase()?.trim().orEmpty()
+            if (f.isEmpty()) return null
+            return when (rankOf(f, kbps)) {
+                RANK_MASTER -> "臻品母带"
+                RANK_FLAC -> "无损 FLAC"
+                RANK_HIGH -> "320k"
+                RANK_LOSSY -> if (kbps > 0) "${kbps}kbps" else "低音质"
+                else -> null
+            }
+        }
     }
 
     /**
@@ -169,9 +207,44 @@ class KuwoClient(
             for (tryBr in orderedChain(br)) {
                 val r = fetchResolved(rid, tryBr) ?: continue
                 // duration <= 0 表示接口没给时长，不能据此判死，放行
-                if (r.durationMs <= 0L || r.durationMs >= MIN_VALID_DURATION_MS) return@withContext r
-                failedBrs = failedBrs + tryBr
-                Log.w(TAG, "音质 $tryBr 只拿到 ${r.durationMs / 1000}s 试听片段，降级")
+                if (r.durationMs > 0L && r.durationMs < MIN_VALID_DURATION_MS) {
+                    failedBrs = failedBrs + tryBr
+                    Log.w(TAG, "音质 $tryBr 只拿到 ${r.durationMs / 1000}s 试听片段，降级")
+                    continue
+                }
+                return@withContext r
+            }
+            null
+        }
+
+    /**
+     * 取链，并且**只接受达到 [minRank] 的结果**（v2.4.10）。
+     *
+     * 存在的理由：酷我对「没有该音质授权」的处理是**静默降档** ——
+     * 请求 `20900kmflac`，它回 `format=mp3&bitrate=128`，时长完整、URL 可用，
+     * 一切「成功」。只看 null / 非 null 会被它骗。
+     *
+     * 与 [resolve] 的区别：这里每一档都要校验实际格式，达不到就继续往下一档试，
+     * 全部达不到返回 null —— 由调用方决定「宁可放别的源」还是「就在这一档凑合」。
+     *
+     * @param minRank 最低可接受分级（[RANK_LOSSY] / [RANK_HIGH] / [RANK_FLAC] / [RANK_MASTER]）
+     */
+    suspend fun resolveAtLeast(rid: String, minRank: Int, br: String = BR_MASTER): ResolvedSong? =
+        withContext(Dispatchers.IO) {
+            // 只有母带档可能给出母带，低档位不必白试三次
+            val chain = if (minRank >= RANK_MASTER) listOf(BR_MASTER) else orderedChain(br)
+            for (tryBr in chain) {
+                val r = fetchResolved(rid, tryBr) ?: continue
+                if (r.durationMs > 0L && r.durationMs < MIN_VALID_DURATION_MS) {
+                    failedBrs = failedBrs + tryBr
+                    continue
+                }
+                if (r.rank < minRank) {
+                    // 降档发生在服务端，跟请求档位无关；记下来少发几次请求
+                    Log.w(TAG, "音质 $tryBr 实际只有 ${r.format}/${r.kbps}kbps（rank=${r.rank}），不够 $minRank")
+                    continue
+                }
+                return@withContext r
             }
             null
         }
@@ -194,14 +267,51 @@ class KuwoClient(
         }
         val data = resp.data ?: return null
         val u = data.url?.ifEmpty { null } ?: return null
+        val rawBr = data.bitrate?.toIntOrNull() ?: 0
+        // ⚠️ 酷我的 `bitrate` 字段对母带/无损给的是**档位代号**（20900 / 2000），
+        // 不是真码率：20900 当成 kbps 会算出 547MB 的单曲体积（真实约 140MB）。
+        // 只有 <= 1000 的值才可信（320/128 这些 mp3 档确实报的是 kbps）。
+        // 母带真实码率靠 Content-Length / 时长反算，见 probeRealKbps。
+        val kbps = rawBr.takeIf { it in 1..1000 } ?: 0
+        val size = data.size?.toLongOrNull()?.takeIf { it > 0 }
+            ?: probeContentLength(u)
+        val realKbps = when {
+            kbps > 0 -> kbps
+            size != null && size > 0 && data.duration > 0 ->
+                (size * 8L / data.duration / 1000L).toInt()
+            else -> 0
+        }
         return ResolvedSong(
             rid = rid,
             url = u,
             br = data.br ?: br,
             durationMs = data.duration * 1000L,
-            ekey = data.ekey?.ifEmpty { null }
+            ekey = data.ekey?.ifEmpty { null },
+            format = data.format,
+            kbps = realKbps,
+            sizeBytes = size ?: 0L
         )
     }
+
+    /**
+     * 用 Range 请求读 `Content-Range` 里的总字节数。
+     *
+     * 只取 1 字节，不下载整首；CDN 支持 Range 时一次往返就够。
+     * 拿不到就返回 null —— 宁可不显示体积，也不显示错的。
+     */
+    private fun probeContentLength(url: String): Long? = runCatching {
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", "okhttp/4.10.0")
+            .header("Referer", "http://www.kuwo.cn/")
+            .header("Range", "bytes=0-0")
+            .build()
+        client.newCall(req).execute().use { resp ->
+            // Content-Range: bytes 0-0/141123456
+            resp.header("Content-Range")?.substringAfterLast('/')?.toLongOrNull()
+                ?: resp.header("Content-Length")?.toLongOrNull()
+        }
+    }.getOrNull()
 
     /**
      * 榜单封面归一化。v9_pic2 形如 `.../albumcover/120/s4s6/89/4105923142.jpg`，
@@ -545,5 +655,14 @@ data class ResolvedSong(
     val url: String,
     val br: String,
     val durationMs: Long,
-    val ekey: String?
-)
+    val ekey: String?,
+    /** 响应里的真实容器格式（mp3 / flac / mflac / mgg / aac / ogg…）。空 = 老响应没给 */
+    val format: String? = null,
+    /** 响应里的真实码率（kbps）。0 = 没给。母带按体积÷时长反算，不取档位代号 */
+    val kbps: Int = 0,
+    /** 整首字节数（来自响应 size 或 Content-Range）。0 = 不知道 */
+    val sizeBytes: Long = 0L
+) {
+    /** 实际音质分级，见 [KuwoClient.rankOf]。**这是「只升不降」唯一的判据**。 */
+    val rank: Int get() = KuwoClient.rankOf(format, kbps)
+}

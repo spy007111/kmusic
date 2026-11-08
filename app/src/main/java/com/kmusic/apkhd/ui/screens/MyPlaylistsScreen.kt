@@ -35,6 +35,13 @@ import com.kmusic.apkhd.ui.theme.window
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
 import com.kmusic.apkhd.ui.theme.wspSp
+import com.kmusic.apkhd.ui.tv.tvFocus
+import com.kmusic.apkhd.ui.tv.requestFocusSafely
+import com.kmusic.apkhd.ui.tv.LocalIsTv
+import com.kmusic.apkhd.ui.tv.rememberTvPanelFocus
+import com.kmusic.apkhd.ui.tv.tvRowFocus
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.focusProperties
 
 /**
  * 「我的歌单」页 —— 媒体库里唯一装歌单的入口。
@@ -80,6 +87,18 @@ fun MyPlaylistsScreen(
     // 「创建的」排序必须和这里的下标一致，否则滚动到的是别人
     val sortedCreated = remember(userPlaylists) { userPlaylists.sortedByDescending { it.createdAt } }
 
+    // v2.4.2：进页面**不抢焦点**，只保证「进内容区就能看见选中」。
+    //
+    // 试过 90/250/450/800/1300ms 五次 requestFocus 硬抢，每次都返回 true 但下一帧
+    // 焦点又被还回左侧导航栏 —— 页面切换时 Compose 会把焦点交给上一个持焦的页面，
+    // 抢不过，再重试只是和用户抢方向盘。
+    //
+    // 侧栏先持焦是**全 App 一致**的行为（首页冷启动也落在侧栏），用户按 → 进内容区。
+    // 这里真正要修的是「进了内容区看不见选中」，已由 PlaylistRow 的
+    // tvFocus(fullWidth = true) 解决。
+    val firstRowFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+    val chipFocus = remember { androidx.compose.ui.focus.FocusRequester() }
+
     // AI 生成完：切到「创建的」+ 滚到新歌单 + 说一句建好了。
     // 以前只在设置页留一行字，用户点完只能自己去列表里猜哪条是新的。
     LaunchedEffect(aiCreatedId) {
@@ -98,14 +117,21 @@ fun MyPlaylistsScreen(
         onAiCreatedShown()
     }
 
-    Column(modifier = modifier.fillMaxSize().background(c.bg)) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(c.bg)
+    ) {
         // ── 顶栏 ──
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 8.wdp, vertical = 8.wdp),
+            Modifier.fillMaxWidth().padding(horizontal = 8.wdp, vertical = 8.wdp)
+                // v2.4.2：顶栏成组，列表按 ↑ 能稳定落到「返回 / 新建」
+                .tvRowFocus(),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Box(
                 Modifier.size(44.wdp).clip(RoundedCornerShape(22.wdp))
+                    .tvFocus()
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -126,6 +152,7 @@ fun MyPlaylistsScreen(
             if (tab == 1) {
                 Row(
                     Modifier.clip(RoundedCornerShape(10.wdp))
+                        .tvFocus()
                         .clickable(
                             indication = null,
                             interactionSource = remember { MutableInteractionSource() }
@@ -149,9 +176,19 @@ fun MyPlaylistsScreen(
             Modifier.fillMaxWidth().padding(horizontal = 16.wdp, vertical = 4.wdp),
             horizontalArrangement = Arrangement.spacedBy(8.wdp)
         ) {
-            SegmentChip("收藏的 ${favoritePlaylists.size}", tab == 0, c) { tab = 0 }
-            SegmentChip("创建的 ${userPlaylists.size}", tab == 1, c) { tab = 1 }
+            SegmentChip(
+                "收藏的 ${favoritePlaylists.size}", tab == 0, c,
+                focus = if (tab == 0) chipFocus else null
+            ) { tab = 0 }
+            SegmentChip(
+                "创建的 ${userPlaylists.size}", tab == 1, c,
+                focus = if (tab == 1) chipFocus else null
+            ) { tab = 1 }
         }
+
+        // 当前 tab 的列表是不是空的 —— AI 卡的 ↓ 要据此决定落点
+        val curListIsEmpty =
+            if (tab == 0) favoritePlaylists.isEmpty() else sortedCreated.isEmpty()
 
         // ── AI 建歌单 ──
         // 放在分段**下面**而不是塞进某一列：两个分段都可能想用（"再来一批类似的"），
@@ -160,6 +197,13 @@ fun MyPlaylistsScreen(
             available = aiAvailable,
             loading = aiLoading,
             error = aiError,
+            // 空列表时的焦点落点：分段按钮下面是这张 AI 卡片，
+            // 它自己也是满宽可聚焦行 —— 不定焦的话 Compose 的默认搜索会先落上去，
+            // 我们的 requestFocus 就被它抢了（实测三次重试全失败）。
+            focus = if (favoritePlaylists.isEmpty() && userPlaylists.isEmpty()) firstRowFocus else null,
+            down = if (curListIsEmpty) chipFocus else firstRowFocus,
+            // 有歌单时让位：焦点直接落到第一行，不被这张通栏卡拦截
+            focusable = curListIsEmpty,
             onStart = { showAi = true }
         )
 
@@ -177,6 +221,7 @@ fun MyPlaylistsScreen(
                     rowOf = { i ->
                         val p = favoritePlaylists[i]
                         PlaylistRow(
+                            focus = if (i == 0) firstRowFocus else null,
                             name = p.name,
                             subtitle = listOfNotNull(
                                 p.creator.takeIf { it.isNotBlank() },
@@ -204,6 +249,7 @@ fun MyPlaylistsScreen(
                     rowOf = { i ->
                         val p = sortedCreated[i]
                         PlaylistRow(
+                            focus = if (i == 0) firstRowFocus else null,
                             name = p.name,
                             subtitle = if (p.tracks.isEmpty()) "空歌单 · 点进去加歌"
                                 else "${p.tracks.size} 首 · 本机保存",
@@ -254,6 +300,18 @@ private fun AiPlaylistCard(
     available: Boolean,
     loading: Boolean,
     error: String?,
+    /** v2.4.2：空列表时的焦点落点 */
+    focus: androidx.compose.ui.focus.FocusRequester? = null,
+    /** v2.4.2：按 ↓ 去哪。几何搜索从这张通栏卡往下会跳空，必须显式指定。 */
+    down: androidx.compose.ui.focus.FocusRequester? = null,
+    /**
+     * v2.4.2：这张卡要不要参与遥控焦点。
+     *
+     * 当前 tab 有歌单时**必须**关掉：它是通栏大卡，几何上压在列表上方，
+     * 遥控从内容区往下走会先撞上它，把下面的歌单行全挡住 ——
+     * 用户报的「进我的歌单选不到歌单」一半是这个原因。
+     */
+    focusable: Boolean = true,
     onStart: () -> Unit
 ) {
     val c = moyinColors()
@@ -264,20 +322,37 @@ private fun AiPlaylistCard(
             .padding(horizontal = 16.wdp, vertical = 6.wdp)
             .clip(RoundedCornerShape(14.wdp))
             .background(c.s1)
-            .clickable(
-                indication = null,
-                interactionSource = remember { MutableInteractionSource() }
-            ) {
-                when {
-                    loading -> Unit
-                    !available -> android.widget.Toast.makeText(
-                        ctx,
-                        "先在「我的 → AI 导赏」填 API Key",
-                        android.widget.Toast.LENGTH_SHORT
-                    ).show()
-                    else -> onStart()
-                }
-            }
+            .then(if (focus != null) Modifier.focusRequester(focus) else Modifier)
+            .then(
+                // ⚠️ 有歌单时**整条 clickable 都不能挂**。
+                //
+                // 试过 `.focusProperties { canFocus = false }` —— 不管用：
+                // `clickable` 内部自带焦点节点（Modifier.clickable 的 semantics +
+                // focusable），外层 focusProperties 拦不住它，遥控照样落在卡上，
+                // 把下面真正的歌单行全挡住。只能从根上不挂 clickable。
+                //
+                // 卡片在「有歌单」时本来也只是引导入口（点了要么提示填 Key、
+                // 要么弹 AI 输入框），让位给歌单访问优先级更高 —— 这两个 tab
+                // 各自的第一行才是用户要按的东西。
+                if (focusable) Modifier
+                    .focusProperties { if (down != null) this.down = down }
+                    .tvFocus(shape = RoundedCornerShape(14.wdp))
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() }
+                    ) {
+                        when {
+                            loading -> Unit
+                            !available -> android.widget.Toast.makeText(
+                                ctx,
+                                "先在「我的 → AI 导赏」填 API Key",
+                                android.widget.Toast.LENGTH_SHORT
+                            ).show()
+                            else -> onStart()
+                        }
+                    }
+                else Modifier
+            )
             .padding(horizontal = 14.wdp, vertical = 12.wdp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -335,11 +410,20 @@ private fun sourceLabel(source: String): String = when (source) {
 }
 
 @Composable
-private fun SegmentChip(text: String, selected: Boolean, c: com.kmusic.apkhd.ui.theme.MoyinColors, onClick: () -> Unit) {
+private fun SegmentChip(
+    text: String,
+    selected: Boolean,
+    c: com.kmusic.apkhd.ui.theme.MoyinColors,
+    /** v2.4.2：空列表时作为焦点兜底落点 */
+    focus: androidx.compose.ui.focus.FocusRequester? = null,
+    onClick: () -> Unit
+) {
     Box(
         Modifier
+            .then(if (focus != null) Modifier.focusRequester(focus) else Modifier)
             .clip(RoundedCornerShape(9.wdp))
             .background(if (selected) c.accentFill else c.s2)
+            .tvFocus(shape = RoundedCornerShape(9.wdp))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -407,6 +491,8 @@ private fun PlaylistList(
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun PlaylistRow(
+    /** v2.4.2：首行定焦用；null = 不抢焦点 */
+    focus: androidx.compose.ui.focus.FocusRequester? = null,
     name: String,
     subtitle: String,
     coverUrl: String?,
@@ -417,6 +503,10 @@ private fun PlaylistRow(
     Row(
         Modifier
             .fillMaxWidth()
+            .then(if (focus != null) Modifier.focusRequester(focus) else Modifier)
+            // v2.4.2：整行补焦点视觉 —— 原来只有 combinedClickable，遥控能选中但
+            // 屏幕上毫无反馈，用户报的「选不到歌单 / 焦点消失」就是这个。
+            .tvFocus(shape = RoundedCornerShape(10.wdp), fullWidth = true)
             .combinedClickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,

@@ -1,5 +1,6 @@
 package com.kmusic.apkhd.ui.screens
 
+
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -25,9 +26,6 @@ import androidx.compose.ui.unit.sp
 import com.kmusic.apkhd.ui.components.EqBandSliders
 import com.kmusic.apkhd.ui.components.EqCurve
 import com.kmusic.apkhd.ui.components.EqPresetGroupedChips
-import com.kmusic.apkhd.ui.components.SaveCurveDialog
-import com.kmusic.apkhd.ui.components.UserCurveList
-import com.kmusic.apkhd.ui.components.suggestedCurveName
 import com.kmusic.apkhd.ui.components.MoyinIcon
 import com.kmusic.apkhd.ui.components.MoyinTitle
 import com.kmusic.apkhd.ui.components.MoyinSwitch
@@ -42,6 +40,8 @@ import com.kmusic.apkhd.ui.theme.moyinColors
 import com.kmusic.apkhd.ui.theme.wdp
 import com.kmusic.apkhd.ui.theme.wsp
 import androidx.compose.foundation.lazy.items
+import androidx.compose.ui.focus.focusProperties
+import com.kmusic.apkhd.ui.tv.tvFocus
 
 /** 主题选项 */
 data class ThemeOption(val label: String, val mode: ThemeMode)
@@ -114,6 +114,40 @@ fun ProfileScreen(
     /** 省电播放（offload）：开了音效失效 */
     audioOffload: Boolean = false,
     onAudioOffloadChange: (Boolean) -> Unit = {},
+    audioOffloadStatus: String = "等待输出确认",
+    audioOutputMode: String = "processed",
+    onAudioOutputModeChange: (String) -> Unit = {},
+    audioInterruptionResume: Boolean = true,
+    onAudioInterruptionResumeChange: (Boolean) -> Unit = {},
+    audioInterruptionStatus: String = "等待音频中断",
+    callAutoResume: Boolean = true,
+    onCallAutoResumeChange: (Boolean) -> Unit = {},
+    callMonitorStatus: String = "未授权",
+    onRequestCallPermission: () -> Unit = {},
+    truePeakEnabled: Boolean = false,
+    truePeakCeilingDb: Float = -1f,
+    truePeakStatus: String = "关闭",
+    onTruePeakEnabledChange: (Boolean) -> Unit = {},
+    onTruePeakCeilingChange: (Float) -> Unit = {},
+    usbOutputStatus: String = "未连接USB设备",
+    usbModeAvailable: Boolean = false,
+    deviceProfiles: List<com.kmusic.apkhd.data.DeviceEqProfile> = emptyList(),
+    deviceProfileAuto: Boolean = false,
+    deviceProfileStatus: String = "全局音效",
+    deviceProfileActiveId: String? = null,
+    hasConfirmedAudioRoute: Boolean = false,
+    onBindDeviceProfile: (String) -> Unit = {},
+    devicePreGainDb: Float = 0f,
+    onDevicePreGainChange: (Float) -> Unit = {},
+    onDeviceProfileAutoChange: (Boolean) -> Unit = {},
+    onSaveDeviceProfile: (String, Boolean) -> Unit = { _, _ -> },
+    onApplyDeviceProfile: (String?) -> Unit = {},
+    onDeleteDeviceProfile: (String) -> Unit = {},
+    onRequestDevicePermission: () -> Unit = {},
+    pureAudioMode: Boolean = false,
+    onPureAudioModeChange: (Boolean) -> Unit = {},
+    bluetoothAutoResume: Boolean = false,
+    onBluetoothAutoResumeChange: (Boolean) -> Unit = {},
     /** DSD 输出采样率：44100 / 88200 */
     dsdOutRate: Int = 44100,
     onDsdOutRateChange: (Int) -> Unit = {},
@@ -122,6 +156,9 @@ fun ProfileScreen(
     onDsdBypassEqChange: (Boolean) -> Unit = {},
     wifiOnlyDownload: Boolean,
     onWifiOnlyDownloadChange: (Boolean) -> Unit,
+    /** 母带仅在 Wi-Fi 下播放（默认关：流量也照播母带） */
+    masterWifiOnly: Boolean = false,
+    onMasterWifiOnlyChange: (Boolean) -> Unit = {},
     /** 冷启动后自动接着播（默认关：停在原位等用户按播放） */
     autoResumePlayback: Boolean = false,
     onAutoResumePlaybackChange: (Boolean) -> Unit = {},
@@ -190,13 +227,13 @@ fun ProfileScreen(
     var qualityExpanded by remember { mutableStateOf(false) }
     var cacheExpanded by remember { mutableStateOf(false) }
     var loudnessExpanded by remember { mutableStateOf(false) }
-    var dsdRateExpanded by remember { mutableStateOf(false) }
+    var outputModeExpanded by remember { mutableStateOf(false) }
     var eqExpanded by remember { mutableStateOf(false) }
     // 均衡器详情区（预设 + 频段滑块）默认收起 —— 设置页以前滑块常驻，太长
     var eqDetailOpen by remember { mutableStateOf(false) }
-    // A3：保存曲线浮层 + 当前生效的用户曲线名
-    var savingCurve by remember { mutableStateOf(false) }
-    var activeCurveName by remember { mutableStateOf<String?>(null) }
+    var legacyCurvesOpen by remember { mutableStateOf(false) }
+    var deletingLegacyCurve by remember { mutableStateOf<String?>(null) }
+    val currentMode = AudioSettingsPresentation.currentMode(audioOutputMode)
     // "endpoint" / "key" / "model" —— 非空时弹出输入框
     var aiEditing by remember { mutableStateOf<String?>(null) }
     var fxBassExpanded by remember { mutableStateOf(false) }
@@ -233,6 +270,7 @@ fun ProfileScreen(
             Box(
                 Modifier
                     .fillMaxWidth()
+                    .tvFocus(fullWidth = true)
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -352,7 +390,17 @@ fun ProfileScreen(
         // ── 底部安全区（车机悬浮栏兜底）───────────────────────
         item {
             Column(Modifier.fillMaxWidth().padding(top = 6.wdp)) {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        // v2.4.1：整行可聚焦，开关自身退出焦点竞争（同上）
+                        .tvFocus()
+                        .clickable(
+                            indication = null,
+                            interactionSource = remember { MutableInteractionSource() }
+                        ) { onSafeBottomChange(if (safeBottomSetting < 0) 56 else -1) },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Column(Modifier.weight(1f)) {
                         Text("底部安全区", color = c.t1, fontSize = 14.wsp)
                         Text(
@@ -364,7 +412,10 @@ fun ProfileScreen(
                         checked = safeBottomSetting < 0,
                         onCheckedChange = { auto ->
                             onSafeBottomChange(if (auto) -1 else 56)
-                        }
+                        },
+                        modifier = Modifier
+                            .tvFocus(enabled = false)
+                            .focusProperties { canFocus = false }
                     )
                 }
                 if (safeBottomSetting >= 0) {
@@ -384,6 +435,7 @@ fun ProfileScreen(
                 text = "网络与存储",
                 modifier = Modifier
                     .padding(top = 16.wdp)
+                    .tvFocus()
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -548,8 +600,8 @@ fun ProfileScreen(
                 title = "响度归一",
                 subtitle = when (loudnessMode) {
                     "off" -> "关闭：保持原曲音量，切歌可能忽大忽小"
-                    "album" -> "按专辑统一：保留专辑内的强弱起伏"
-                    else -> "按单曲统一：每首歌拉到同一响度（仅本地文件）"
+                    "album" -> "使用专辑标签；无标签回退单曲（仅衰减、本地文件）"
+                    else -> "按单曲降低过响音量，不放大安静歌曲（仅本地文件）"
                 },
                 value = when (loudnessMode) {
                     "off" -> "关闭"
@@ -572,52 +624,16 @@ fun ProfileScreen(
                 )
             }
         }
-        item {
-            SettingSwitchRow(
-                title = "省电播放",
-                subtitle = if (audioOffload) {
-                    "已开启：直通 DSP，均衡器与音效全部失效"
-                } else {
-                    "直通 DSP 省电，代价是均衡器与音效失效"
-                },
-                checked = audioOffload,
-                onCheckedChange = onAudioOffloadChange
-            )
+        item(key = "playback-mode") {
+            SettingRow(title = "播放模式", subtitle = currentMode.description,
+                value = currentMode.label.removeSuffix("（推荐）"),
+                onClick = { outputModeExpanded = !outputModeExpanded })
         }
-        item {
-            SettingRow(
-                title = "DSD 输出采样率",
-                subtitle = when (dsdOutRate) {
-                    88200 -> "88.2 kHz：保留到 40 kHz 的高频，设备不支持时自动降到 44.1 kHz"
-                    else -> "44.1 kHz：CD 规格，兼容性最好"
-                },
-                value = if (dsdOutRate == 88200) "88.2 kHz" else "44.1 kHz",
-                onClick = { dsdRateExpanded = !dsdRateExpanded }
-            )
-        }
-        if (dsdRateExpanded) {
-            item {
-                InlineOptions(
-                    options = listOf(
-                        "44100" to "44.1 kHz（默认）",
-                        "88200" to "88.2 kHz"
-                    ),
-                    selected = dsdOutRate.toString(),
-                    onPick = { onDsdOutRateChange(it.toInt()); dsdRateExpanded = false }
-                )
-            }
-        }
-        item {
-            SettingSwitchRow(
-                title = "DSD 播放时旁路均衡器",
-                subtitle = if (dsdBypassEq) {
-                    "已开启：DSD 解码链已占满 CPU，EQ 会挤掉音频线程导致卡顿；设置会保留，切回普通格式立刻恢复"
-                } else {
-                    "关闭：即使播放 DSD 也保持均衡器生效，可能出现卡顿"
-                },
-                checked = dsdBypassEq,
-                onCheckedChange = onDsdBypassEqChange
-            )
+        if (outputModeExpanded) item {
+            InlineOptions(com.kmusic.apkhd.playback.AudioModeDefaults.visibleModes(usbModeAvailable, audioOutputMode)
+                    .map { it to AudioSettingsPresentation.currentMode(it).label },
+                selected = audioOutputMode,
+                onPick = { onAudioOutputModeChange(it); outputModeExpanded = false })
         }
         item {
             SettingRow(
@@ -722,6 +738,7 @@ fun ProfileScreen(
             Box(
                 Modifier
                     .fillMaxWidth()
+                    .tvFocus(fullWidth = true)
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -742,6 +759,27 @@ fun ProfileScreen(
                 checked = eqEnabled,
                 onCheckedChange = onEqEnabledChange
             )
+        }
+        item {
+            com.kmusic.apkhd.ui.components.SoundSchemeSection(
+                profiles = deviceProfiles,
+                activeId = deviceProfileActiveId,
+                hasConfirmedRoute = hasConfirmedAudioRoute,
+                onSave = onSaveDeviceProfile,
+                onApply = onApplyDeviceProfile,
+                onDelete = onDeleteDeviceProfile,
+                onBind = onBindDeviceProfile,
+                deviceAutoEnabled = deviceProfileAuto,
+                onDeviceAutoChange = onDeviceProfileAutoChange
+            )
+        }
+        item {
+            SettingRow(title = "使用原声", subtitle = "暂不使用音效；已保存的方案不会删除。",
+                onClick = { onAudioOutputModeChange("pure") })
+        }
+        if (userEqPresets.isNotEmpty()) item {
+            SettingRow(title = "以前保存的曲线", subtitle = "仍可使用，保存新音效请用我的音效方案。",
+                value = "选择", onClick = { legacyCurvesOpen = true })
         }
         // 预设行常显；只把频段区折起来 —— 滑块/曲线常驻时手指落在上面等于改曲线。
         if (eqPresets.isNotEmpty()) {
@@ -796,25 +834,6 @@ fun ProfileScreen(
                         fontSize = 11.wsp,
                         modifier = Modifier.padding(horizontal = 18.wdp, vertical = 2.wdp)
                     )
-                }
-                // A3：保存当前曲线 —— 只有一个动作，不加开关
-                item {
-                    SettingRow(
-                        title = "保存当前曲线",
-                        subtitle = "只存这 ${eqBands.size} 段增益，不含低音/响度；同名覆盖",
-                        value = if (userEqPresets.isEmpty()) null else "已有 ${userEqPresets.size} 条",
-                        onClick = { savingCurve = true }
-                    )
-                }
-                if (userEqPresets.isNotEmpty()) {
-                    item {
-                        UserCurveList(
-                            presets = userEqPresets,
-                            activeName = if (eqCustom) activeCurveName else null,
-                            onApply = { onApplyEqCurve(it) },
-                            onDelete = { name -> onDeleteEqCurve(name) }
-                        )
-                    }
                 }
             }
         }
@@ -944,7 +963,7 @@ fun ProfileScreen(
 
         // 下载队列本身在「媒体库 → 下载管理」，这里只留限制条件 ——
         // 两处都能看队列的话，用户在设置页点一下会以为跳到了别的地方
-        item { SectionHeader(text = "下载", modifier = Modifier.padding(top = 16.wdp)) }
+        item { SectionHeader(text = "下载与流量", modifier = Modifier.padding(top = 16.wdp)) }
         item {
             SettingSwitchRow(
                 title = "仅 Wi-Fi 下载",
@@ -953,22 +972,51 @@ fun ProfileScreen(
                 onCheckedChange = onWifiOnlyDownloadChange
             )
         }
+        // 跟「仅 Wi-Fi 下载」放一起：两个都是「流量下别干这件事」的开关。
+        // 母带一首 140MB（5.4Mbps），比无损大 4 倍，值不值得为它烧流量由用户定。
+        item {
+            SettingSwitchRow(
+                title = "母带仅 Wi-Fi 播放",
+                subtitle = if (masterWifiOnly) {
+                    "已开启：流量下用 GD 无损（约 35MB/首），Wi-Fi 才用母带（约 140MB/首）"
+                } else {
+                    "关闭：流量下也照播母带。一首约 140MB，听十首约 1.4GB"
+                },
+                checked = masterWifiOnly,
+                onCheckedChange = onMasterWifiOnlyChange
+            )
+        }
     }
 
-    // A3：保存曲线的命名浮层（放在 LazyColumn 外面，避免被列表裁掉）
-    if (savingCurve) {
-        SaveCurveDialog(
-            suggestion = suggestedCurveName(
-                eqCustom,
-                eqPresets.getOrNull(eqPreset) ?: eqPresets.firstOrNull()
-            ),
-            onDismiss = { savingCurve = false },
-            onConfirm = { name ->
-                onSaveEqCurve(name)
-                savingCurve = false
-            }
+    if (legacyCurvesOpen) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { legacyCurvesOpen = false },
+            title = { Text("以前保存的曲线") },
+            text = {
+                androidx.compose.foundation.lazy.LazyColumn(Modifier.heightIn(max = 360.wdp)) {
+                    items(userEqPresets, key = { it.name }) { preset ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            androidx.compose.material3.TextButton(modifier = Modifier.weight(1f), onClick = {
+                                onAudioOutputModeChange("processed")
+                                onApplyDeviceProfile(null)
+                                onApplyEqCurve(preset)
+                                legacyCurvesOpen = false
+                            }) { Text(preset.name, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                            androidx.compose.material3.TextButton(onClick = { deletingLegacyCurve = preset.name }) { Text("删除") }
+                        }
+                    }
+                }
+            },
+            confirmButton = { androidx.compose.material3.TextButton(onClick = { legacyCurvesOpen = false }) { Text("完成") } }
         )
     }
+    deletingLegacyCurve?.let { name ->
+        androidx.compose.material3.AlertDialog(onDismissRequest = { deletingLegacyCurve = null },
+            title = { Text("删除曲线？") }, text = { Text("删除「$name」不会影响歌曲或其他方案。") },
+            confirmButton = { androidx.compose.material3.TextButton(onClick = { onDeleteEqCurve(name); deletingLegacyCurve = null }) { Text("删除") } },
+            dismissButton = { androidx.compose.material3.TextButton(onClick = { deletingLegacyCurve = null }) { Text("取消") } })
+    }
+
 }
 
 /** 行内展开的单选列表（主题 / 音质共用） */
@@ -989,6 +1037,7 @@ private fun InlineOptions(
             Row(
                 Modifier
                     .fillMaxWidth()
+                    .tvFocus(fullWidth = true)
                     .clickable(
                         indication = null,
                         interactionSource = remember { MutableInteractionSource() }
@@ -1061,6 +1110,9 @@ private fun SettingRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            // v2.4.2：满宽整行用 fullWidth —— 左侧 3dp 竖条当锚点，
+            // 否则一整条 1750px 宽的淡色带子很难看出「焦点在哪一行」
+            .tvFocus(fullWidth = true)
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }
@@ -1089,6 +1141,18 @@ private fun formatCacheBytes(bytes: Long): String {
     return if (mb >= 1024) String.format("%.1f GB", mb / 1024) else String.format("%.0f MB", mb)
 }
 
+/**
+ * 带开关的设置行。
+ *
+ * ⚠️ v2.4.1：整行必须**自己可聚焦**。
+ *
+ * 以前这一行只有 [MoyinSwitch] 内部有 `tvFocus`，行长 300dp、开关只有 44×26dp，
+ * 遥控器几何搜索几乎命不中那个小方块 —— 用户的感受就是「无损降级 / 省电播放 /
+ * DSD / 均衡器 这一整行选不上」，而同页纯文本行（[SettingRow]）却正常。
+ *
+ * 现在：整行一个焦点目标（`tvFocus` + `clickable` 整行切换），开关本体
+ * `canFocus = false` 退出焦点竞争 —— 否则每行要按两次方向键（一次到行、一次到开关）。
+ */
 @Composable
 private fun SettingSwitchRow(
     title: String,
@@ -1100,6 +1164,12 @@ private fun SettingSwitchRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            // v2.4.2：满宽整行 + 左侧锚点竖条，同 SettingRow
+            .tvFocus(fullWidth = true)
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() }
+            ) { onCheckedChange(!checked) }
             .padding(vertical = 10.wdp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -1111,7 +1181,14 @@ private fun SettingSwitchRow(
             }
         }
         Spacer(Modifier.width(8.dp))
-        MoyinSwitch(checked = checked, onCheckedChange = onCheckedChange)
+        MoyinSwitch(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            // 整行已经是焦点目标，开关不再单独参与遥控焦点
+            modifier = Modifier
+                .tvFocus(enabled = false)
+                .focusProperties { canFocus = false }
+        )
     }
 }
 
@@ -1151,6 +1228,7 @@ private fun AccentSwatch(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
             .clip(RoundedCornerShape(12.wdp))
+            .tvFocus(shape = RoundedCornerShape(12.wdp))
             .clickable(
                 indication = null,
                 interactionSource = remember { MutableInteractionSource() }

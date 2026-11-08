@@ -19,6 +19,18 @@ import kotlin.math.tan
  */
 class R128(val sampleRate: Int, private val channels: Int) {
 
+    companion object {
+        const val ALGORITHM_VERSION = 2
+
+        /** 无声道布局元数据时仅支持 mono/stereo；不猜测 surround/LFE 权重。 */
+        fun supportsChannels(channels: Int): Boolean = channels in 1..2
+    }
+
+    private val channelWeights = DoubleArray(channels.also {
+        require(supportsChannels(it)) { "R128 requires mono/stereo; unknown multichannel layout: $it" }
+        require(sampleRate > 0) { "Invalid sample rate: $sampleRate" }
+    }) { 1.0 }
+
     // K 加权：第一级高架（+4dB @1.7kHz），第二级高通（38Hz）
     private val sb = FloatArray(3)
     private val sa = FloatArray(2)
@@ -87,9 +99,9 @@ class R128(val sampleRate: Int, private val channels: Int) {
                 val ht = hState[ch]
                 val y2 = hb[0] * y1 + hb[1] * ht[0] + hb[2] * ht[1] - ha[0] * ht[2] - ha[1] * ht[3]
                 ht[1] = ht[0]; ht[0] = y1; ht[3] = ht[2]; ht[2] = y2
-                frameSq += (y2 * y2).toDouble()
+                frameSq += y2.toDouble() * y2 * channelWeights[ch]
             }
-            segSum += frameSq / channels
+            segSum += frameSq
             segFill++
             frames++
             if (segFill >= segLen) {

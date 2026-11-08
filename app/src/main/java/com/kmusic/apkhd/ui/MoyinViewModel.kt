@@ -43,6 +43,11 @@ import com.kmusic.apkhd.net.KuwoClient
 import com.kmusic.apkhd.net.DavEntry
 import com.kmusic.apkhd.net.WebDavClient
 import com.kmusic.apkhd.playback.DavAuth
+import com.kmusic.apkhd.playback.NetworkMonitor
+import com.kmusic.apkhd.playback.PrefetchWindow
+import com.kmusic.apkhd.playback.AudioRuntimeState
+import com.kmusic.apkhd.playback.PlaybackRecovery
+import com.kmusic.apkhd.playback.PlaybackRecoveryToken
 import com.kmusic.apkhd.net.LyricRepository
 import com.kmusic.apkhd.net.NavidromeClient
 import com.kmusic.apkhd.net.LyricQuery
@@ -107,13 +112,43 @@ import com.kmusic.apkhd.net.AlbumMatch
  */
 @UnstableApi
 /** 音乐人每批展示数量 */
-private const val ARTIST_BATCH = 12
+private const val ARTIST_BATCH = 20
 
 /** 音乐人翻页时一次拉多少（多拉一些，本地切片，减少请求次数） */
 private const val ARTIST_PAGE = 60
 
+/**
+ * 音乐人累计上限（v2.4.5 无限下拉）。
+ *
+ * `artist/list` 的 offset 翻页是稳定的（实测 offset 0/20/40/60 返回四批完全不同的人），
+ * 理论上能一直翻下去；但首页是一行无限横滑，不设上限用户会一直往下拉，
+ * 所以到 200 个就停止追加 —— 够 10 屏，远超实际浏览深度。
+ */
+private const val ARTIST_MAX = 200
+
+/**
+ * 推荐歌单累计上限。
+ *
+ * `personalized/playlist` **没有 offset**，每次都是随机一批，只能靠反复请求 + 去重累积。
+ * 实测连调 3 次（limit=20）去重后共 51 个，第 2 批新增 19、第 3 批新增 12 —— 衰减很明显。
+ * 连续两轮拿不到新歌单就停，另外硬性封顶 100 个，避免用户一直滑一直空转。
+ */
+private const val PLAYLIST_MAX = 100
+
+/** 推荐歌单「下拉追加」最多尝试几轮空请求就认定服务端已经给不出新内容 */
+private const val PLAYLIST_EMPTY_ROUNDS = 2
+
 /** 取链连续失败几次才报错（含第一次；再多就当作整条队列都取不到链） */
 private const val MAX_PLAY_TRY = 3
+
+/**
+ * 停播等网络的最长时间（v2.4.6）。
+ *
+ * 断网时不能像以前那样顺延（离线每首都取不到链，连跳三首只会把队列耗光并误报
+ * 「三家都没有音源」）。但也不能无限期挂着 —— 用户可能已经出门、早就没网了，
+ * 界面必须给出明确结果。8 分钟足够覆盖地铁过隧道、电梯、Wi-Fi 切换这些场景。
+ */
+private const val OFFLINE_WAIT_LIMIT_MS = 8L * 60 * 1000
 
 /**
  * 已解析直链的复用时限。
@@ -187,7 +222,8 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      * 直接等 inits 里那个 ListenableFuture 就行，连上的瞬间立刻返回。
      */
     private suspend fun readyController(): MediaController? {
-        controller?.let { return it }
+        controller?.takeIf { it.isConnected }?.let { return it }
+        if (controllerFuture == null && !com.kmusic.apkhd.playback.PlaybackSessionExit.isExitRequested) connectController()
         val f = controllerFuture ?: return null
         return withTimeoutOrNull(6_000) {
             suspendCancellableCoroutine { cont ->
@@ -221,6 +257,43 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 当前这次点播。新的点播直接取消旧的 —— 替代手写的 playSeq 版本号 */
     private var playJob: Job? = null
+    private var queueEpoch = 0L
+    private val queueEpochUpdates = kotlinx.coroutines.flow.MutableStateFlow(0L)
+    private var loudnessJob: Job? = null
+    private var loudnessEpoch = 0L
+
+    private fun recoveryToken(t: Track): PlaybackRecoveryToken =
+        PlaybackRecoveryToken(AudioRuntimeState.snapshot.playbackEpoch, queueEpoch, t.id)
+
+    private fun canRecover(token: PlaybackRecoveryToken): Boolean {
+        val runtime = AudioRuntimeState.snapshot
+        return PlaybackRecovery.canCommit(token, runtime.playbackEpoch, queueEpoch,
+            queue.getOrNull(queueIndex)?.id, runtime.desiredPlaying,
+            runtime.suppressionReason != Player.PLAYBACK_SUPPRESSION_REASON_NONE)
+    }
+
+    private suspend fun recoveryReady(token: PlaybackRecoveryToken): Boolean {
+        kotlinx.coroutines.flow.combine(AudioRuntimeState.updates, queueEpochUpdates) { runtime, _ -> runtime }.first { runtime ->
+            val current = PlaybackRecovery.canCommit(token, runtime.playbackEpoch, queueEpoch,
+                queue.getOrNull(queueIndex)?.id, runtime.desiredPlaying, suppressed = false)
+            !current || runtime.suppressionReason == Player.PLAYBACK_SUPPRESSION_REASON_NONE
+        }
+        return canRecover(token)
+    }
+
+    private fun cancelPendingPlayback() {
+        com.kmusic.apkhd.playback.AudioPrecacheBridge.cancel()
+        playJob?.cancel()
+        offlineWatchdog?.cancel()
+        awaitingNetwork = false
+        restoring = false
+        restoreWatchdog?.cancel()
+        playbackState = playbackState.copy(isPlaying = false, buffering = false, stalled = false)
+    }
+
+    /** 直链缓存用「歌曲身份」做键，换源不能把原队列条目挤掉。 */
+    private fun streamKey(t: Track): String =
+        if (t.source in SourceCatalog.ONLINE) "${t.name}|${t.artist}|${t.durationMs}" else t.id
 
     /** 这条 id 的直链还能用就返回它（没解析过 / 已过期 → null） */
     private fun peekStream(id: String): Track? = streams[id]
@@ -237,10 +310,12 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      * 取消要原样抛出：`runCatching` 会把 CancellationException 吞成 null，
      * 于是「取消了」和「取链失败」混为一谈，旧协程还会继续往下写状态。
      */
-    private suspend fun resolveOnce(t: Track): Track? {
-        peekStream(t.id)?.let { return it }
+    private suspend fun resolveOnce(t: Track, force: Boolean = false): Track? {
+        val key = streamKey(t)
+        if (force) invalidateStream(t)
+        else peekStream(key)?.let { return it }
         val mine = CompletableDeferred<Track?>()
-        inFlight.putIfAbsent(t.id, mine)?.let { return it.await() }
+        inFlight.putIfAbsent(key, mine)?.let { return it.await() }
         var out: Track? = null
         try {
             out = resolveForPlayback(t)
@@ -250,13 +325,13 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             out = null
         } finally {
             out?.let {
-                streams[it.id] = Stream(it, android.os.SystemClock.elapsedRealtime())
+                streams[key] = Stream(it, android.os.SystemClock.elapsedRealtime())
                 // 登记进「最新直链」表：播放器 timeline 里存的是旧 URL，
                 // DataSource 在 open 时会用这里的新地址替换（签名过期自愈）。
                 rememberPlayUrl(it)
             }
             mine.complete(out)                    // 等待方永远能拿到结果，不会挂死
-            inFlight.remove(t.id, mine)
+            inFlight.remove(key, mine)
         }
         return out
     }
@@ -268,8 +343,14 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     private fun mediaItemOf(t: Track): MediaItem {
         val raw = if (t.source == "local") localLib.trackUri(t).toString() else t.playUrl.orEmpty()
         val uri = Uri.parse(cacheKeyed(t, raw))
+        val namespace = when (t.source) {
+            "webdav" -> com.kmusic.apkhd.playback.PlaybackCacheKey.namespace(davUrl, davUser)
+            "navidrome" -> null
+            else -> null
+        }
         return MediaItem.Builder()
             .setUri(uri)
+            .setCustomCacheKey(com.kmusic.apkhd.playback.PlaybackCacheKey.of(t, namespaceHash = namespace))
             .setMediaId(t.id)
             .setMediaMetadata(
                 MediaMetadata.Builder()
@@ -318,7 +399,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun resolveOnline(t: Track): Track? {
         val own = when (t.source) {
             SourceCatalog.KUWO -> kuwoResolved(t.sourceId, t)
-            SourceCatalog.NETEASE -> gdResolved(t)
+            SourceCatalog.NETEASE -> neteaseResolved(t)
             SourceCatalog.MIGU -> miguResolved(t)
             else -> null
         }
@@ -331,6 +412,18 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 SourceCatalog.NETEASE -> matchNetease(t)
                 SourceCatalog.MIGU -> matchMigu(t)
                 else -> null
+            }
+            // 只升不降（v2.4.10）：酷我经常「请求母带、给 128k mp3」。
+            // 换源本来是为了「能出声」，不是为了「换来一个更差的」——
+            // 上一源是无损/母带时，低于无损的一律不要，宁可继续试下一个源。
+            if (got != null && t.qualityRank >= KuwoClient.RANK_FLAC &&
+                got.qualityRank < KuwoClient.RANK_FLAC
+            ) {
+                DiagLog.log(
+                    "PLAY_CHAIN_SKIP",
+                    "'${t.name}'/${t.artist} → $src 只有 ${got.qualityLabel}，比原源差，跳过"
+                )
+                continue
             }
             if (got != null) {
                 DiagLog.log(
@@ -346,23 +439,145 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * 网易云直链（不换源）。
      *
-     * 顺序：gdstudio → 网易云直连。
+     * 顺序：GD（`music-api.gdstudio.xyz`，能给真 FLAC）→ 网易云官方直连（只有 320k）。
      *
-     * ⚠️ gdstudio 的 `types=url` 在 music.gdstudio.org 上已经 **401**
-     * （只剩 `types=playlist` 可用），所以实际生效的通常是第二条。
-     * 保留第一条是为了它哪天恢复时能自动用回「无损」档。
+     * **标签按实际 `br` 写，不再一律挂「无损」** —— 以前 `url()` 只要非空就写「无损」，
+     * 而当时域名指向的 `music.gdstudio.org` 恒 401，实际播的一直是 320k，
+     * 界面上却显示无损。现在用 [GdLink.isLossless] 判定：
+     * - `br ≥ 700` → 真 FLAC，标「无损」
+     * - `br < 700` → 标实际码率（`320k` / `128k`），不撒谎
      *
      * 直连也有拿不到的：`code=-110` = 需 VIP/付费版权。这不是 bug，
      * 上层会走换源（酷我/咪咕）。
      */
     private suspend fun gdResolved(t: Track): Track? {
-        runCatching { gd.url(t.sourceId) }.getOrNull()
-            ?.takeIf { it.isNotBlank() }
-            ?.let { return t.copy(playUrl = it, qualityLabel = "无损") }
+        val link = runCatching { gd.resolve(t.sourceId) }.getOrNull()
+        if (link != null) {
+            val label = GdStudioClient.labelOf(link.br)
+            DiagLog.log(
+                "PLAY_GD",
+                "'${t.name}' id=${t.sourceId} br=${link.br} size=${link.size / 1024 / 1024}MB → $label"
+            )
+            return t.copy(
+                playUrl = link.url,
+                qualityLabel = label,
+                qualityRank = GdStudioClient.rankOf(link.br),
+                sourceKbps = link.br,
+                sourceBytes = link.size
+            )
+        }
+        // GD 拿不到才回官方直连：不登录只有 320k，VIP 曲直接 -110
         val direct = runCatching { netease.playUrl(t.sourceId) }.getOrNull()
             ?.takeIf { it.isNotBlank() }
-            ?: return null
-        return t.copy(playUrl = direct, qualityLabel = "320k")
+            ?: run {
+                DiagLog.log("PLAY_GD_MISS", "'${t.name}' id=${t.sourceId} GD 无链，官方也拿不到")
+                return null
+            }
+        DiagLog.log("PLAY_GD_FALLBACK", "'${t.name}' id=${t.sourceId} GD 无链 → 官方 320k")
+        return t.copy(
+            playUrl = direct,
+            qualityLabel = "320k",
+            qualityRank = KuwoClient.RANK_HIGH,
+            sourceKbps = 320
+        )
+    }
+
+    // ---------------- 网易歌单 → 酷我母带（v2.4.10，方案 A+B）----------------
+
+    /**
+     * 网易 id → 酷我 rid 的映射缓存（方案 B）。
+     *
+     * 值里的 `rank` 是**这首在酷我上实际能拿到的最高分级**：
+     * - `>= RANK_FLAC`：值得再来一次
+     * - `RANK_NONE`：酷我没有/只有低码率，**下次直接跳过搜索**（负缓存）
+     *
+     * 键用 `name|artist` 而不是网易 id：同一个 id 在不同歌单里是同一首，
+     * 但跨源匹配的输入只有歌名+歌手，用 id 做键会在「同 id 不同版本」上错配。
+     */
+    private val neToKuwo = java.util.concurrent.ConcurrentHashMap<String, KuwoMapEntry>()
+
+    private data class KuwoMapEntry(val rid: String, val rank: Int)
+
+    private fun kuwoMapKey(t: Track) = "${t.name}|${t.artist}"
+
+    /**
+     * 网易源曲目：**先问酷我能不能给更好的，再回 GD**（v2.4.10）。
+     *
+     * 为什么顺序反了：以前 `resolveOnline` 里网易源只走 [gdResolved]，
+     * GD 一出链就结束，酷我连一次搜索都没发过 —— 于是
+     * 「臻品母带」这个设置对网易歌单完全无效，用户听着 CD 级无损却以为自己选的是母带。
+     *
+     * 现在的规则（**只升不降**）：
+     * 1. 档位不是「母带」→ 不查酷我，直接 GD（省 0.4s）
+     * 2. 「母带仅 Wi-Fi」开着且当前是流量 → 不查酷我，直接 GD 无损
+     * 3. 查酷我并取链，**只有拿到 RANK_MASTER 才用**；给 mp3/aac 一律丢弃
+     * 4. 酷我没有 / 只有低档 → 回落 GD 无损（最差也是现在的水平）
+     *
+     * 三重校验由 [matchOnKuwo] 完成（歌名 / 歌手 / 时长 ±3s），不放松。
+     */
+    private suspend fun neteaseResolved(t: Track): Track? {
+        val wantMaster = defaultQuality == "master"
+        val canProbeKuwo = wantMaster && !(masterWifiOnly && !onWifi())
+
+        if (canProbeKuwo) {
+            val key = kuwoMapKey(t)
+            val cached = neToKuwo[key]
+
+            // 负缓存：上次已确认酷我没母带（rank < MASTER）→ 不再白搜一次
+            val rid = when {
+                cached == null -> matchOnKuwo(t)?.rid
+                cached.rank >= KuwoClient.RANK_MASTER && cached.rid.isNotEmpty() -> cached.rid
+                else -> null
+            }
+
+            if (rid != null) {
+                val song = runCatching {
+                    client.resolveAtLeast(rid, KuwoClient.RANK_MASTER)
+                }.getOrNull()
+
+                if (song != null && song.rank >= KuwoClient.RANK_MASTER) {
+                    val label = KuwoClient.labelOf(song.format, song.kbps) ?: "臻品母带"
+                    neToKuwo[key] = KuwoMapEntry(rid, song.rank)
+                    DiagLog.log(
+                        "PLAY_MASTER",
+                        "'${t.name}' 网易→酷我 rid=$rid ${song.format}/${song.kbps}kbps → $label"
+                    )
+                    val cipher = song.ekey?.let { client.createCipher(it) }
+                    KuwoCipherHolder.put(song.url, cipher)
+                    return t.copy(
+                        source = "kuwo",
+                        sourceId = rid,
+                        playUrl = song.url,
+                        ekey = song.ekey,
+                        qualityLabel = label,
+                        qualityRank = song.rank,
+                        sourceKbps = song.kbps,
+                        sourceBytes = song.sizeBytes,
+                        isMaster = true,
+                        durationMs = if (song.durationMs > 0) song.durationMs else t.durationMs
+                    )
+                }
+                // 有 rid 但拿不到母带：记负缓存，省得每首都试
+                neToKuwo[key] = KuwoMapEntry(rid, KuwoClient.RANK_NONE)
+                DiagLog.log(
+                    "PLAY_MASTER_MISS",
+                    "'${t.name}' rid=$rid 酷我无母带（实际=${song?.format}/${song?.kbps}）→ 回落 GD"
+                )
+            } else {
+                neToKuwo[key] = KuwoMapEntry("", KuwoClient.RANK_NONE)
+            }
+        }
+
+        return gdResolved(t)
+    }
+
+    /** 当前是否在 Wi-Fi 上（无网络能力信息时按「不是 Wi-Fi」从严处理） */
+    private fun onWifi(): Boolean {
+        val cm = getApplication<Application>()
+            .getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+            as? android.net.ConnectivityManager ?: return false
+        val caps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) } ?: return false
+        return caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)
     }
 
     /** 咪咕直链（不换源） */
@@ -389,7 +604,13 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 TrackMatcher.artistMatches(t.artist, it.artist)
         } ?: return null
         val resolved = gdResolved(hit) ?: return null
-        return t.copy(playUrl = resolved.playUrl, qualityLabel = "无损")
+        return t.copy(
+            playUrl = resolved.playUrl,
+            qualityLabel = resolved.qualityLabel,
+            qualityRank = resolved.qualityRank,
+            sourceKbps = resolved.sourceKbps,
+            sourceBytes = resolved.sourceBytes
+        )
     }
 
     /**
@@ -438,7 +659,11 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             .minByOrNull { kotlin.math.abs(it.durationMs - t.durationMs) }
             ?: return null
         val resolved = runCatching { migu.resolve(best) }.getOrNull() ?: return null
-        return t.copy(playUrl = resolved.playUrl, qualityLabel = resolved.qualityLabel)
+        return t.copy(
+            playUrl = resolved.playUrl,
+            qualityLabel = resolved.qualityLabel,
+            qualityRank = KuwoClient.RANK_LOSSY
+        )
     }
 
     /** 走酷我取链，并把这一首的解密器**按直链**登记进密钥表 */
@@ -467,13 +692,21 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             return null
         }
         KuwoCipherHolder.put(r.url, cipher)
+        // 标签按**响应里的真实格式/码率**写（v2.4.10）。
+        // 以前按请求的 br 常量写：请求 20900kmflac、服务端回 128k mp3，界面照样挂「臻品母带」。
+        val realLabel = KuwoClient.labelOf(r.format, r.kbps)
+        val label = realLabel ?: qualityLabel(r.br)
+        DiagLog.log("PLAY_KUWO", "rid=$rid 请求=${qualityTiers().firstOrNull()} 实际=${r.format}/${r.kbps}kbps → $label")
         return display.copy(
             source = "kuwo",
             sourceId = rid,
             playUrl = r.url,
             ekey = r.ekey,
-            qualityLabel = qualityLabel(r.br),
-            isMaster = r.br == KuwoClient.BR_MASTER,
+            qualityLabel = label,
+            qualityRank = r.rank,
+            sourceKbps = r.kbps,
+            sourceBytes = r.sizeBytes,
+            isMaster = r.rank >= KuwoClient.RANK_MASTER,
             durationMs = if (r.durationMs > 0) r.durationMs else display.durationMs
         )
     }
@@ -512,6 +745,77 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 连续「播放期失败→顺延」的次数；成功起播即清零 */
     private var consecutivePlayErrors = 0
+    private val unsupportedAudioSkips = com.kmusic.apkhd.playback.UnsupportedAudioSkipPolicy()
+
+    /**
+     * 网络边沿监听（v2.4.6）。
+     *
+     * 断网时播放器失败后**不能顺延**：离线状态下每一首取链都会失败，连跳 3 首只会
+     * 把队列耗光，还把「没网」误报成「酷我/网易云/咪咕都没有音源」。正确做法是停在
+     * 当前曲等网络回来，再由 [onNetworkRegained] 原地续播。
+     */
+    private val networkMonitor = NetworkMonitor(app)
+
+    /** 因为断网而停在当前曲；网络恢复后由它触发续播 */
+    private var awaitingNetwork = false
+
+    /** 断网瞬间的播放位置（播放器报错后 currentPosition 可能已经归零，先记下来） */
+    private var offlineResumeAt = 0L
+
+    /**
+     * 等网看门狗（v2.4.6）。
+     *
+     * 只靠 `ConnectivityManager.onAvailable` 是不够的：**Wi-Fi 连着但路由器断了 / 酒店门户 /
+     * DNS 挂了** 时，网络接口一直是 UP，系统不会报「恢复」，回调永远不来。
+     * 所以停住等网时同时起一个每 15 秒自己试一次取链的定时器 ——
+     * 网一通就续播，无论系统怎么描述网络状态。最多守 8 分钟，之后放行顺延，避免无限期卡住。
+     */
+    private var offlineWatchdog: kotlinx.coroutines.Job? = null
+
+    /**
+     * 播放看门狗（v2.4.7）。每 30 秒体检「该在播却没在播」，兜住 STATE_ENDED 之外的静默停播。
+     */
+    private var playGuard: kotlinx.coroutines.Job? = null
+
+    /**
+     * 整条队列已经播完（v2.4.7）。
+     *
+     * 播完后 player.playWhenReady 仍是 true（ExoPlayer 播完不会自动清它），
+     * 30 秒看门狗会因此判定「该播没播」并反复接管 —— 实测会每 30 秒重复提示「队列已播完」。
+     * 用户只要重新播放（点歌/下一首/恢复网络）就清掉它。
+     */
+    private var queueFinished = false
+
+    /**
+     * 「整条队列播完、停在末尾」的标记（v2.4.8 替代 v2.4.7 里直接写 playWhenReady=false）。
+     *
+     * 与 [queueFinished] 的区别：queueFinished 表示「看门狗别管了」，
+     * endedParked 表示「播放器被我们主动刹停在末尾，用户再按播放要回队首」。
+     * 两者同时成立；分开是因为它们被清除的时机不同（用户按播放时都要清）。
+     */
+    private var endedParked = false
+
+    /** onPlaybackEnded 重入保护（v2.4.8） */
+    private var handlingEnded = false
+
+    /** 正在执行「播完刹停」的 playWhenReady=false，挡住回调里的重入（v2.4.8） */
+    private var parkingAtEnd = false
+
+    /** 上一次看到的 playWhenReady，用来识别「假 → 真」边沿（见 onPlayWhenReadyChanged） */
+    private var wasPlayWhenReady = false
+
+    /**
+     * 本轮缓冲的起点（SystemClock.elapsedRealtime）；不在缓冲时为 0（v2.4.8）。
+     *
+     * 只用来算 `stalled`（连续缓冲超过 3 秒）—— UI 只在真卡住时叠加载圈，
+     * 「缓冲一下立刻好」这种网络抖动不该每次都闪一个转圈。
+     */
+    private var bufferingSince = 0L
+
+    private companion object StalledHint {
+        /** 连续缓冲超过这个时长才提示加载圈 */
+        const val STALL_HINT_MS = 3_000L
+    }
 
     /** 直链登记表用的键：与 `#k=` 缓存片段同源，保证一处失效处处失效 */
     private fun registryKey(t: Track): String =
@@ -524,16 +828,139 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 把这条曲目的直链从所有缓存里作废，下一次 resolve 必然重新打接口 */
     private fun invalidateStream(t: Track) {
-        streams.remove(t.id)
+        streams.remove(streamKey(t))
         PlaybackUrlRegistry.forget(registryKey(t))
+    }
+
+    /**
+     * 播放器播到 timeline 末尾时接管（v2.4.7）。
+     *
+     * 这是「听了几首歌定住」的最后一道保险：即使补窗因为任何原因没补上，
+     * 这里也能把队列里该播的下一首接上，而不是让用户对着一条走满的进度条发呆。
+     *
+     * 顺序模式走到队列末尾 = 真的播完了 → 明确提示，不再无声无息。
+     * 循环/随机模式下 ExoPlayer 的 repeatMode 会自己回绕，根本不会进 ENDED；
+     * 万一进了（repeatMode 没设上等异常），也按「接着往下播」处理。
+     */
+    private fun onPlaybackEnded() {
+        val c = controller ?: return
+        // 防重入：STATE_ENDED 回调与 30s 看门狗可能在同一毫秒双双命中
+        // （实测日志里 02:58:12.003~.004 连出三条 PLAY_ENDED）。
+        // 已经在处理就直接返回，避免重复 toast / 重复切歌。
+        if (handlingEnded) return
+        handlingEnded = true
+        try {
+            handlePlaybackEndedInner(c)
+        } finally {
+            handlingEnded = false
+        }
+    }
+
+    private fun handlePlaybackEndedInner(c: Player) {
+        val curId = runCatching { c.currentMediaItem?.mediaId }.getOrNull()
+        val idx = curId?.let { id -> queue.indexOfFirst { it.id == id } } ?: queueIndex
+        DiagLog.log("PLAY_ENDED", "播放器到达 timeline 末尾（当前逻辑第 ${idx + 1}/${queue.size} 首）")
+
+        if (playMode == PlayMode.LOOP || playMode == PlayMode.SHUFFLE || playMode == PlayMode.SINGLE) {
+            // repeatMode 本该拦住，走到这里说明状态没落上 —— 补一次并从头继续
+            applyPlayMode(c)
+            if (queue.isNotEmpty()) {
+                DiagLog.log("PLAY_ENDED", "循环模式异常停在末尾，回到队首继续")
+                queueIndex = 0
+                playCurrent()
+            }
+            return
+        }
+
+        val next = com.kmusic.apkhd.playback.QueueContinuation.nextToPlayAfterEnd(idx, queue.size)
+        if (next == null) {
+            queueFinished = true
+            // 落 playWhenReady=false 这一步必须保留（v2.4.7 结论）：
+            // 遥控器/通知栏/耳机线的播放键是 MediaSession 直接调 player.play()，
+            // 不经过 togglePlay；playWhenReady 若一直是 true 就没有「假→真」边沿，
+            // 实测会退化成「重播最后一首」。
+            //
+            // v2.4.8 补充：这条赋值本身会在回调里再走一遍，用 [parkingAtEnd] 挡掉，
+            // 免得起初那种「onPlaybackEnded ↔ onPlayWhenReadyChanged」来回触发。
+            parkingAtEnd = true
+            runCatching { c.playWhenReady = false }
+            parkingAtEnd = false
+            endedParked = true
+            playbackState = playbackState.copy(isPlaying = false, buffering = false, stalled = false)
+            DiagLog.log("PLAY_ENDED", "队列已播完（共 ${queue.size} 首）")
+            toast("队列已播完")
+            persistSession()
+            return
+        }
+        queueFinished = false
+        DiagLog.log("PLAY_ENDED", "自动接上队列第 ${next + 1} 首 '${queue[next].name}'")
+        queueIndex = next
+        playCurrent()
+    }
+
+    /**
+     * 把播放器的 `playWhenReady`（用户意图）同步进 UI 状态（v2.4.8）。
+     *
+     * 这是 `playbackState.isPlaying` 的**唯一**权威写入点 —— 其余地方只在
+     * 「切换意图的当下」乐观写一次（点播放/点暂停/起播/播完），最终都会被这里校正。
+     * 这样「缓冲时图标乱翻」就不可能再发生：缓冲不改变 playWhenReady。
+     */
+    private fun syncIntentFromPlayer(c: Player, playWhenReady: Boolean) {
+        if (playbackState.isPlaying == playWhenReady) return
+        playbackState = playbackState.copy(isPlaying = playWhenReady)
+    }
+
+    /**
+     * 播放看门狗（v2.4.7）：每 30 秒体检一次，只处理「该在播却没在播」。
+     *
+     * 为什么还要这一层：STATE_ENDED 能兜住「正常播完」，兜不住
+     * 「timeline 被清空 / 播放器进了 IDLE / playWhenReady 被谁置回 false」这类异常，
+     * 那些同样表现为「定住、不报错」。这条看门狗不猜原因，只看结果。
+     *
+     * 只在**用户明确处于播放态**时介入，避免打断用户自己按的暂停。
+     */
+    private fun startPlayGuard() {
+        playGuard?.cancel()
+        playGuard = viewModelScope.launch {
+            while (true) {
+                delay(30_000L)
+                val c = controller ?: continue
+                val st = runCatching { c.playbackState }.getOrNull() ?: continue
+                val wantPlay = runCatching { c.playWhenReady }.getOrDefault(false)
+                // 这里要的正是「此刻到底出没出声」——问 player.isPlaying 是对的
+                val audible = runCatching { c.isPlaying }.getOrDefault(false)
+                // 用户暂停 / 正在等网 / 正在缓冲 / 正在恢复中 / 整条队列已播完：都不该插手
+                if (!wantPlay || awaitingNetwork || restoring || queueFinished) continue
+                if (st == Player.STATE_BUFFERING) continue
+                if (audible) continue
+                if (playbackState.track == null) continue
+                if (queue.isEmpty()) continue
+
+                if (st == Player.STATE_ENDED) {
+                    onPlaybackEnded()
+                    continue
+                }
+                val suppressed = c.playbackSuppressionReason != Player.PLAYBACK_SUPPRESSION_REASON_NONE
+                if (!PlaybackRecovery.needsRepair(st, Player.STATE_READY, Player.STATE_IDLE,
+                        wantPlay, audible, suppressed, c.playerError != null)) continue
+                val at = runCatching { c.currentPosition }.getOrDefault(0L)
+                val t = queue.getOrNull(queueIndex) ?: continue
+                val token = recoveryToken(t)
+                DiagLog.log("PLAY_GUARD", "播放链异常（state=$st，${at}ms），原位恢复 '${t.name}'")
+                invalidateStream(t)
+                streamRetried.remove(streamKey(t))
+                playbackState = playbackState.copy(buffering = true, error = null)
+                val fresh = resolveOnce(t) ?: continue
+                if (canRecover(token)) retryInPlace(fresh.copy(id = t.id), at, token)
+            }
+        }
     }
 
     private fun handlePlaybackError(error: androidx.media3.common.PlaybackException) {
         // ⚠️ 必须问播放器要「真正出错的那一首」，不能用 playbackState.track：
         // 自动连播/切歌的瞬间它还停在上一首，按它重取会重取错歌、跳错位置。
         val mediaId = runCatching { controller?.currentMediaItem?.mediaId }.getOrNull()
-        val t = mediaId?.let { id -> queue.firstOrNull { it.id == id } ?: streams[id]?.track }
-            ?: playbackState.track
+        val t = mediaId?.let { id -> queue.firstOrNull { it.id == id } } ?: playbackState.track
         val code = runCatching { error.errorCodeName }.getOrDefault("ERROR")
         val msg = error.message.orEmpty().take(180)
         // host 从「播放器里真正在放的那条 URI」取：队列表里存的 Track 往往没有 playUrl，
@@ -550,16 +977,23 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         lastPlayError = "$detail（${t?.name ?: "?"}）"
         DiagLog.log("PLAY_ERR", "$detail track=${t?.name} source=${t?.source} urlHost=$host")
 
+        if (com.kmusic.apkhd.playback.UnsupportedAudioPolicy.isUnsupported(error.errorCode)) {
+            skipUnsupportedAudio(t)
+            return
+        }
+
         // ── 一级：WebDAV 换一条路（直链 ↔ 原始 302 地址） ──
         if (t != null && t.source == "webdav" && davRetried.add(t.id)) {
+            val token = recoveryToken(t)
             viewModelScope.launch {
                 val raw = t.sourceId.orEmpty()
                 val alt = if (t.playUrl == raw) {
                     runCatching { davClient?.resolveStream(raw) }.getOrNull()
                 } else raw
+                if (!recoveryReady(token)) return@launch
                 if (!alt.isNullOrEmpty() && alt != t.playUrl) {
                     toast("这条直链打不开，换一条路重试")
-                    startPlayback(t.copy(playUrl = alt), queueIndex, 0)
+                    retryInPlace(t.copy(playUrl = alt), playbackState.positionMs, token)
                 } else {
                     playbackState = playbackState.copy(isPlaying = false, buffering = false, error = detail)
                     toast("WebDAV 播放失败：$detail")
@@ -568,28 +1002,155 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
 
+        // ── 断网：停止顺延，原地等网络回来（v2.4.6） ──
+        //
+        // 顺序很重要：这一段必须排在「在线源重取链」和「顺延下一首」之前。
+        // 离线时重取必然失败、顺延必然连败 —— 以前正是这样把「没网」演成
+        // 「酷我/网易云/咪咕都没有音源」，而且恢复后没有任何人再试。
+        //
+        // 注意条件里**不要求** networkMonitor.isOffline()：Wi-Fi 连着但路由器没网时，
+        // 系统仍会报「有网」，可取链一样失败。凡是网络类错误，一律先进等网；
+        // 只要网是通的，下一次探测（15s 内）就会自己续播，等于多等最多 15 秒。
+        // 比起「连跳三首 + 误报无音源」，这个代价划算得多。
+        if (t != null && isOfflineError(error)) {
+            val at = runCatching { controller?.currentPosition ?: 0L }.getOrDefault(0L)
+                .takeIf { it > 0L } ?: playbackState.positionMs
+            // 不清 consecutivePlayErrors：等网这段不算「这首救不回来」，
+            // 恢复后如果真失败还要靠它兜底顺延。
+            enterAwaitingNetwork(t, at)
+            return
+        }
+
         // ── 二级：在线源作废旧链、重新取链、原地续播 ──
         // 这是 ERROR_CODE_IO_BAD_HTTP_STATUS 最常见的原因：签名过期。
-        if (t != null && t.source in SourceCatalog.ONLINE && streamRetried.add(t.id)) {
+        if (t != null && t.source in SourceCatalog.ONLINE && streamRetried.add(streamKey(t))) {
             val resumeAt = runCatching { controller?.currentPosition ?: 0L }.getOrDefault(0L)
             invalidateStream(t)
+            val originalId = t.id
+            val token = recoveryToken(t)
             playbackState = playbackState.copy(buffering = true, error = null)
             DiagLog.log("PLAY_RETRY", "重新取链 '${t.name}'（接着 ${resumeAt}ms 播）")
             viewModelScope.launch {
                 val fresh = resolveOnce(t)
+                if (!recoveryReady(token)) return@launch
                 if (fresh == null) {
                     DiagLog.log("PLAY_RETRY", "重取失败 '${t.name}' → 顺延下一首")
                     skipAfterError(t, detail)
                     return@launch
                 }
                 toast("音频流断了，已重新连接")
-                retryInPlace(fresh, resumeAt)
+                retryInPlace(fresh.copy(id = originalId), resumeAt, token)
             }
             return
         }
 
         // ── 三级：救不回来了，顺延下一首 ──
         skipAfterError(t, detail)
+    }
+
+    /**
+     * 这个错误是不是「网络根本连不上」。
+     *
+     * 只看 `ERROR_CODE_IO_NETWORK_CONNECTION_FAILED` / `ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT`
+     * 两个码：`BAD_HTTP_STATUS`（签名过期 403）虽然也常见，但那是服务端拒绝，
+     * 不该被当成「等网回来」——它有自己的一级重取链兜底。
+     */
+    private fun isOfflineError(error: androidx.media3.common.PlaybackException): Boolean =
+        error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+            error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT
+
+    /**
+     * 在 IO 线程上跑探针，避免 TCP 连接（最长 3 秒）卡住主线程。
+     *
+     * `playLoop` 本身跑在 `viewModelScope`（Main）里，取链已经切过 IO；
+     * 这里是另一处需要显式切换的地方。
+     */
+    private suspend fun probeReachableOnIo(): Boolean =
+        withContext(Dispatchers.IO) { com.kmusic.apkhd.playback.NetProbe.reachable() }
+
+    private fun enterAwaitingNetwork(t: Track, resumeAt: Long) {
+        awaitingNetwork = true
+        offlineResumeAt = resumeAt.coerceAtLeast(0L)
+        playbackState = playbackState.copy(isPlaying = false, buffering = true, error = null)
+        DiagLog.log("NET", "等网络：停在 '${t.name}'（${offlineResumeAt}ms）")
+        toast("网络已断开，恢复后自动续播")
+        startOfflineWatchdog(t)
+    }
+
+    /**
+     * 自主探测式等网：每 15 秒试一次取链，成功就续播。
+     *
+     * 不依赖系统网络回调 —— 「接口 UP 但真的不通」时那个回调不会来。
+     * 8 分钟还没通就放弃等待、走正常顺延，免得用户以为 App 卡死。
+     */
+    private fun startOfflineWatchdog(t: Track) {
+        offlineWatchdog?.cancel()
+        val token = recoveryToken(t)
+        offlineWatchdog = viewModelScope.launch {
+            var waited = 0L
+            while (awaitingNetwork && waited < OFFLINE_WAIT_LIMIT_MS) {
+                delay(15_000L)
+                waited += 15_000L
+                if (!awaitingNetwork || !recoveryReady(token)) return@launch
+                val fresh = resolveOnce(t, force = true)
+                if (!recoveryReady(token)) return@launch
+                if (fresh != null) {
+                    DiagLog.log("NET", "探测到网络已通，续播 '${t.name}'（${offlineResumeAt}ms）")
+                    awaitingNetwork = false
+                    toast("网络已恢复，继续播放")
+                    retryInPlace(fresh.copy(id = t.id), offlineResumeAt, token)
+                    return@launch
+                }
+            }
+            if (awaitingNetwork && canRecover(token)) {
+                DiagLog.log("NET", "等网超过 ${OFFLINE_WAIT_LIMIT_MS / 60_000} 分钟，放弃等待")
+                awaitingNetwork = false
+                skipAfterError(t, "网络长时间不可用")
+            }
+        }
+    }
+
+    /**
+     * 网络恢复：把断网时停下的那首重新取链、回到原位继续播（v2.4.6）。
+     *
+     * 三个必须做的动作，少一个都会「恢复后不动」：
+     * 1. `invalidateStream` —— 断网期间解析失败的负缓存（其实没有负缓存，但旧链可能已过期）
+     * 2. 清 `streamRetried` —— 断网时那次失败已经用掉这唯一的机会，不清就永远不再试
+     * 3. `retryInPlace` —— 用 replaceMediaItem 保留队列与位置，不要 setMediaItems 重铺
+     */
+    private fun onNetworkRegained() {
+        if (!awaitingNetwork) {
+            // 没在等网：仍要清掉「已重试」标记，否则用户手动再播同一首不会重取链
+            streamRetried.clear()
+            return
+        }
+        offlineWatchdog?.cancel()
+        offlineWatchdog = null
+        val id = runCatching { controller?.currentMediaItem?.mediaId }.getOrNull()
+        val t = id?.let { i -> queue.firstOrNull { it.id == i } } ?: playbackState.track
+        if (t == null) {
+            awaitingNetwork = false
+            return
+        }
+        awaitingNetwork = false
+        // 播放器若已因为错误把 timeline 清空，就不能再原地替换，退回普通起播
+        streamRetried.remove(streamKey(t))
+        invalidateStream(t)
+        val resumeAt = offlineResumeAt
+        val token = recoveryToken(t)
+        DiagLog.log("NET", "网络恢复，续播 '${t.name}'（${resumeAt}ms）")
+        playbackState = playbackState.copy(buffering = true, error = null)
+        toast("网络已恢复，继续播放")
+        viewModelScope.launch {
+            val fresh = resolveOnce(t, force = true)
+            if (!recoveryReady(token)) return@launch
+            if (fresh == null) {
+                DiagLog.log("NET", "恢复后重取链失败 '${t.name}' → 顺延")
+                skipAfterError(t, "网络恢复后仍取不到音源")
+                return@launch
+            }
+            retryInPlace(fresh.copy(id = t.id), resumeAt, token)
+        }
     }
 
     /**
@@ -620,9 +1181,34 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         playCurrent()
     }
 
+    private fun skipUnsupportedAudio(t: Track?) {
+        val c = controller ?: return
+        val runtime = AudioRuntimeState.snapshot
+        val ids = queue.map { it.id }
+        val suggested = if (c.hasNextMediaItem()) c.getMediaItemAt(c.nextMediaItemIndex).mediaId else null
+        val nextId = if (t != null && runtime.desiredPlaying && runtime.suppressionReason == 0) {
+            unsupportedAudioSkips.next(t.id, ids, suggested, playMode != PlayMode.ORDER)
+        } else null
+        AudioRuntimeState.invalidatePlayback()
+        cancelPendingPlayback()
+        playbackState = playbackState.copy(isPlaying = false, buffering = false, error = "当前设备不支持此音频格式")
+        toast(com.kmusic.apkhd.playback.UnsupportedAudioPolicy.message(t?.name ?: "当前曲目", nextId != null), long = true)
+        DiagLog.log("PLAY_UNSUPPORTED", "设备不支持 track=${t?.name} next=$nextId")
+        if (nextId == null) {
+            AudioRuntimeState.recordPauseIntent(com.kmusic.apkhd.playback.PauseCause.ERROR)
+            c.pause()
+            c.stop()
+        } else {
+            queueIndex = ids.indexOf(nextId)
+            playCurrent()
+        }
+    }
+
     private fun attachControllerListener(c: MediaController) {
+        wasPlayWhenReady = runCatching { c.playWhenReady }.getOrDefault(false)
         c.addListener(object : Player.Listener {
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                if (controller !== c) return
                 handlePlaybackError(error)
             }
 
@@ -632,7 +1218,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 // 直链缓存是播放时按需填充的，跨源回退 / 外部切歌都可能对不上，
                 // 所以对不上要**退到队列里找**，不是放弃。
                 val id = mediaItem?.mediaId ?: return
-                val fromPrepared = streams[id]?.track
+                val fromPrepared = queue.firstOrNull { it.id == id }?.let { t0 -> streams[streamKey(t0)]?.track }
                 val t = fromPrepared
                     ?: queue.firstOrNull { it.id == id }
                     ?: run {
@@ -651,7 +1237,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 queue.indexOfFirst { it.id == t.id }.takeIf { it >= 0 }?.let { queueIndex = it }
                 playbackState = playbackState.copy(
                     track = t,
-                    isPlaying = true,
+                    isPlaying = c.playWhenReady,
                     buffering = false,
                     error = null,
                     durationMs = if (t.durationMs > 0) t.durationMs else playbackState.durationMs
@@ -678,15 +1264,72 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 // 播放器自己往前走（自动连播/通知栏下一首）时也要把预取窗口往前滚，
                 // 否则只有用户手点的那一次会预取，后面几首又回到「现取现等」。
                 prefetchNext()
+                ensureNextInTimeline(t.id)
             }
 
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                // 「播完刹停」时我们自己置的 false：只同步边沿快照，不当成用户动作
+                // （否则会把 queueFinished 之外的状态机再推一遍，产生重复的 PLAY_ENDED）。
+                if (parkingAtEnd) {
+                    wasPlayWhenReady = playWhenReady
+                    return
+                }
+                // 意图的唯一权威来源（v2.4.8）：凡是 player.play()/pause() 引起的
+                // playWhenReady 变化都会走到这里。缓冲不会改变它，所以图标不会再闪。
+                syncIntentFromPlayer(c, playWhenReady)
+                if (!playWhenReady && !AudioRuntimeState.snapshot.desiredPlaying) cancelPendingPlayback()
+
+                // 队列已播完时用户要求播放（遥控器 OK / 通知栏 / 耳机线都走这里）：
+                // 从队首重听，而不是把最后一首再放一遍。
+                //
+                // ⚠️ 只认「假 → 真」的真正边沿。播放完我们自己也把 playWhenReady 置成 false，
+                // 若只看 `playWhenReady == true`，会和 onPlaybackEnded 里的赋值互相触发。
+                if (playWhenReady == wasPlayWhenReady) return
+                wasPlayWhenReady = playWhenReady
+                if (playWhenReady && (queueFinished || endedParked)) {
+                    queueFinished = false
+                    endedParked = false
+                    if (playMode == PlayMode.ORDER && queue.isNotEmpty()) {
+                        DiagLog.log("PLAY_ENDED", "队列已播完后恢复播放 → 从队首重听")
+                        queueIndex = 0
+                        playCurrent()
+                    }
+                }
+            }
+
+            /**
+             * ⚠️ 这里**不能**写 `playbackState.isPlaying`（v2.4.8）。
+             *
+             * ExoPlayer 的 `isPlaying` = 「正在播 且 没有缓冲」，缓冲一开始就是 false、
+             * 缓冲完又 true。以前直接抄进 `isPlaying`，而按钮图标绑的正是它 ——
+             * 于是弱网/切歌/seek 时每次缓冲，图标都「暂停↔播放」翻一次，
+             * 用户看到的就是「播放一会儿 UI 不停播放暂停切换」。
+             *
+             * 现在 `isPlaying` 只表示**用户意图**，由 playWhenReady 维护；
+             * 真实出声状态写到 `audible`，给确实需要它的地方用。
+             */
             override fun onIsPlayingChanged(isPlaying: Boolean) {
-                playbackState = playbackState.copy(isPlaying = isPlaying)
+                if (playbackState.audible != isPlaying) {
+                    playbackState = playbackState.copy(audible = isPlaying)
+                }
             }
 
             override fun onPlaybackStateChanged(state: Int) {
+                // ── 播放器走到 timeline 末尾（v2.4.7） ──
+                //
+                // 以前这里完全没有 STATE_ENDED 分支（全项目 grep 命中 0 次）。
+                // 于是「补窗没补上」时播放器就静静停在末尾：进度条走满、按钮变回播放三角、
+                // error=null、一行日志都没有 —— 用户看到的就是「听了几首歌定住不动了」。
+                // 实测复现：state=STOPPED、position=230722/buffered=230713、诊断日志 0 条。
+                if (state == Player.STATE_ENDED) {
+                    onPlaybackEnded()
+                    return
+                }
                 // 真的读出流了 = 这次恢复成功，连败计数清零
-                if (state == Player.STATE_READY) consecutivePlayErrors = 0
+                if (state == Player.STATE_READY) {
+                    consecutivePlayErrors = 0
+                    unsupportedAudioSkips.reset()
+                }
                 // 切换音质会按新档位重取当前曲目，新流就绪后跳回原来的播放位置
                 if (state == Player.STATE_READY && pendingSeekMs > 0L) {
                     val target = pendingSeekMs
@@ -724,6 +1367,16 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     var queue: List<Track>
         get() = _queue
         private set(value) {
+            if (_queue != value) {
+                queueEpoch++
+                queueEpochUpdates.value = queueEpoch
+                if (playJob?.isActive == true) {
+                    playJob?.cancel()
+                    playbackState = playbackState.copy(buffering = false, stalled = false)
+                }
+                com.kmusic.apkhd.playback.AudioPrecacheBridge.updateQueueEpoch(queueEpoch)
+                queueBuildJob?.cancel()
+            }
             _queue = value
             // 队列一变就落盘（防抖 400ms）。增删、排序、整体换歌单都会经过这里，
             // 集中一处比在每个调用点手写一行可靠得多。
@@ -746,6 +1399,18 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         private set
     /** 音乐人「换一批」的独立忙碌态 */
     var artistsRefreshing by mutableStateOf(false)
+        private set
+    /** 推荐歌单「下拉加载下一批」忙碌态（v2.4.5） */
+    var playlistsLoadingMore by mutableStateOf(false)
+        private set
+    /** 音乐人「下拉加载下一批」忙碌态（v2.4.5） */
+    var artistsLoadingMore by mutableStateOf(false)
+        private set
+    /** 推荐歌单是否已经拿不出新内容（服务端随机池见底 / 到达上限） */
+    var playlistsExhausted by mutableStateOf(false)
+        private set
+    /** 音乐人是否已经到达累计上限 */
+    var artistsExhausted by mutableStateOf(false)
         private set
 
     // ---- 子页面：榜单 / 歌单 / 歌手 ----
@@ -823,6 +1488,14 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     private val artistCache = mutableListOf<ArtistBrief>()
     private var artistCursor = 0
     private var artistOffset = 0
+
+    /**
+     * 推荐歌单的去重集合（v2.4.5 下拉追加）。
+     *
+     * `personalized/playlist` 没有 offset，只能靠重复请求 + 去重累积。
+     * 首屏 20 个进 [recommendedPlaylists]，之后每次追加都先过这个集合。
+     */
+    private val playlistSeen = mutableSetOf<String>()
 
     private val lyricSkippedSources = mutableMapOf<String, MutableSet<String>>()
 
@@ -1287,16 +1960,23 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 val chartJob = async { client.chart(KuwoClient.BANG_HOT, rn = 20) }
                 val risingJob = async { client.chart(KuwoClient.BANG_RISING, rn = 20) }
                 val newJob = async { client.chart(KuwoClient.BANG_NEW, rn = 20) }
-                val plJob = async { netease.recommendPlaylists(12) }
-                val arJob = async { netease.topArtists(12) }
+                // v2.4.5：首屏各 20 个，之后可以横向滚到底继续追加
+                val plJob = async { netease.recommendPlaylists(ARTIST_BATCH) }
+                val arJob = async { netease.topArtists(ARTIST_BATCH) }
 
                 val hot = runCatching { chartJob.await() }.getOrNull()
                 val rising = runCatching { risingJob.await() }.getOrNull()
                 val fresh = runCatching { newJob.await() }.getOrNull()
                 charts = listOfNotNull(hot, rising, fresh).filter { it.tracks.isNotEmpty() }
-                recommendedPlaylists = runCatching { plJob.await() }.getOrDefault(emptyList())
+                val pls = runCatching { plJob.await() }.getOrDefault(emptyList())
+                recommendedPlaylists = pls
+                // 首屏的歌单要进去重集合，否则下拉第一轮会把它们再取回来一遍
+                playlistSeen.clear()
+                playlistSeen += pls.map { it.id }
+                playlistsExhausted = false
                 val artists = runCatching { arJob.await() }.getOrDefault(emptyList())
                 topArtists = artists
+                artistsExhausted = false
                 // 首屏就把音乐人灌进本地缓存：否则「换一批」的 cursor 没有基准，
                 // 第一次点击只会去请求同一页，看起来毫无变化。
                 if (artistCache.isEmpty() && artists.isNotEmpty()) {
@@ -1327,12 +2007,73 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         playlistsRefreshing = true
         viewModelScope.launch {
             try {
-                runCatching { netease.recommendPlaylists(12) }
+                runCatching { netease.recommendPlaylists(ARTIST_BATCH) }
                     .getOrNull()
                     ?.takeIf { it.isNotEmpty() }
-                    ?.let { recommendedPlaylists = it }
+                    ?.let {
+                        recommendedPlaylists = it
+                        // 「换一批」= 重新洗牌：去重集合跟着换，否则下拉会一直撞旧内容
+                        playlistSeen.clear()
+                        playlistSeen += it.map { p -> p.id }
+                        playlistsExhausted = false
+                        DiagLog.log("HOME_MORE", "换一批(歌单) → ${it.size} 张，去重集重置")
+                    }
             } finally {
                 playlistsRefreshing = false
+            }
+        }
+    }
+
+    /**
+     * 推荐歌单「横向滚到底，自动加载下一批」（v2.4.5）。
+     *
+     * `personalized/playlist` 没有 offset 参数，每次请求都是服务端随机挑一批，
+     * 所以只能**发请求 → 去重 → 追加**。实测第 2 次能新增 19/20、第 3 次新增 12/20，
+     * 之后越来越少 —— 连续 [PLAYLIST_EMPTY_ROUNDS] 轮拿不到新内容就标记
+     * [playlistsExhausted]，UI 停止再触发，避免用户滑到底一直空转请求。
+     *
+     * 一次调用**最多发 2 轮请求**：单轮新内容太少（随机池重叠）时再试一次，
+     * 免得用户每次滑到底只多出两三个卡片。
+     */
+    fun loadMorePlaylists() {
+        if (playlistsLoadingMore || playlistsRefreshing) return
+        if (playlistsExhausted) return
+        if (recommendedPlaylists.size >= PLAYLIST_MAX) {
+            playlistsExhausted = true
+            return
+        }
+        playlistsLoadingMore = true
+        DiagLog.log("HOME_MORE", "歌单追加开始，当前 ${recommendedPlaylists.size}")
+        viewModelScope.launch {
+            try {
+                var emptyStreak = 0
+                var added = 0
+                var round = 0
+                while (round < 2 && emptyStreak < PLAYLIST_EMPTY_ROUNDS) {
+                    round++
+                    val batch = runCatching { netease.recommendPlaylists(ARTIST_BATCH) }
+                        .getOrDefault(emptyList())
+                    if (batch.isEmpty()) break
+                    val fresh = batch.filter { playlistSeen.add(it.id) }
+                    if (fresh.isEmpty()) {
+                        emptyStreak++
+                        continue
+                    }
+                    emptyStreak = 0
+                    added += fresh.size
+                    recommendedPlaylists = recommendedPlaylists + fresh
+                    if (recommendedPlaylists.size >= PLAYLIST_MAX) break
+                }
+                if (added == 0 && emptyStreak >= PLAYLIST_EMPTY_ROUNDS) {
+                    playlistsExhausted = true
+                }
+                if (recommendedPlaylists.size >= PLAYLIST_MAX) playlistsExhausted = true
+                DiagLog.log(
+                    "HOME_MORE",
+                    "歌单追加结束 +$added → ${recommendedPlaylists.size}，exhausted=$playlistsExhausted"
+                )
+            } finally {
+                playlistsLoadingMore = false
             }
         }
     }
@@ -1387,6 +2128,59 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 }
             } finally {
                 artistsRefreshing = false
+            }
+        }
+    }
+
+    /**
+     * 音乐人「横向滚到底，自动加载下一批」（v2.4.5）。
+     *
+     * 与歌单不同，`artist/list` 的 offset 是**稳定**的（实测 0/20/40/60 四批人完全不同），
+     * 所以这里老老实实按 offset 往后翻，不依赖随机去重。
+     *
+     * 复用 [artistCache]：`refreshArtists` 的「换一批」也读它，两条路径共享同一份数据，
+     * 避免一边追加、一边换批时互相打架。追加只往 **列表尾部** 加，不动 cursor。
+     *
+     * 到 [ARTIST_MAX] 就标记 [artistsExhausted]，UI 停止再触发。
+     */
+    fun loadMoreArtists() {
+        if (artistsLoadingMore || artistsRefreshing) return
+        if (artistsExhausted) return
+        if (topArtists.size >= ARTIST_MAX) {
+            artistsExhausted = true
+            return
+        }
+        artistsLoadingMore = true
+        viewModelScope.launch {
+            try {
+                // 本地缓存里还有没展示过的人，先补本地 —— 省一次请求
+                val known = artistCache.map { it.id }.toSet()
+                val notShown = artistCache.filter { a -> topArtists.none { it.id == a.id } }
+                if (notShown.isNotEmpty()) {
+                    val room = ARTIST_MAX - topArtists.size
+                    topArtists = topArtists + notShown.take(room)
+                    if (topArtists.size >= ARTIST_MAX) artistsExhausted = true
+                    return@launch
+                }
+                val fresh = runCatching { netease.topArtists(ARTIST_BATCH, offset = artistOffset) }
+                    .getOrDefault(emptyList())
+                // 服务端翻页边界可能重叠，去掉已在缓存里的
+                val added = fresh.filter { it.id !in known }
+                if (added.isEmpty()) {
+                    artistsExhausted = true
+                    return@launch
+                }
+                artistCache += added
+                artistOffset += fresh.size
+                val room = ARTIST_MAX - topArtists.size
+                topArtists = topArtists + added.take(room)
+                if (topArtists.size >= ARTIST_MAX) artistsExhausted = true
+                DiagLog.log(
+                    "HOME_MORE",
+                    "音乐人追加 +${added.size} → ${topArtists.size}，offset=$artistOffset exhausted=$artistsExhausted"
+                )
+            } finally {
+                artistsLoadingMore = false
             }
         }
     }
@@ -2049,6 +2843,12 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         davRetried.clear()
         streamRetried.clear()
         consecutivePlayErrors = 0
+        unsupportedAudioSkips.reset()
+        // 用户主动点歌 = 不再等上一首的网络恢复，也不再是「已播完」状态
+        awaitingNetwork = false
+        queueFinished = false
+        offlineWatchdog?.cancel()
+        offlineWatchdog = null
         // 用户主动点歌 → 丢掉「上次没播完的位置」，从此按新歌走
         restoredPositionMs = -1L
         queue = queueList
@@ -2084,8 +2884,10 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         restoreWatchdog?.cancel()
         restoreWatchdog = null
         val start = queueIndex
+        AudioRuntimeState.recordPlayIntent()
+        val token = recoveryToken(queue[start])
         playJob?.cancel()
-        playJob = viewModelScope.launch { playLoop(start) }
+        playJob = viewModelScope.launch { playLoop(start, token) }
     }
 
     /**
@@ -2096,7 +2898,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      *
      * 屏幕上的曲目在跳过期间**不动** —— 连跳三首会让标题/封面狂闪，等真播了再切。
      */
-    private suspend fun playLoop(start: Int) {
+    private suspend fun playLoop(start: Int, token: PlaybackRecoveryToken) {
         queue.getOrNull(start)?.let { tapped ->
             playbackState = playbackState.copy(track = tapped, buffering = true, error = null)
             // 切歌就掐掉上一首的导赏请求，否则它会把内容追加到新歌的文本框里。
@@ -2111,8 +2913,21 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         while (true) {
             val t = queue.getOrNull(index) ?: return
             val resolved = resolveOnce(t)
+            if (!recoveryReady(token)) return
             if (resolved != null) {
-                startPlayback(resolved, index, tried)
+                startPlayback(resolved, index, tried, token)
+                return
+            }
+            // 取链失败时先分辨「没网」还是「这首歌真没有」：
+            // 离线状态下每首都会失败，继续跳只会耗光队列，还会把「没网」误报成
+            // 「三家都没有音源」。这里用一个 3 秒的探针实测 —— 探针通不了就是网络问题，
+            // 停在这一首等网（由 onNetworkRegained / 看门狗原地续播）；
+            // 探针通了说明是真没这个音源，照旧顺延下一首。
+            val reachable = probeReachableOnIo()
+            if (!recoveryReady(token)) return
+            if (!reachable) {
+                DiagLog.log("NET", "取链失败且探针不通，判定为网络问题")
+                enterAwaitingNetwork(t, 0L)
                 return
             }
             tried++
@@ -2139,15 +2954,17 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      * 清成一首 —— 正在随机播放的队列会被打乱、通知栏列表也跳一下。`replaceMediaItem`
      * 只换当前这一项，其余顺序、当前位置全部保留。
      */
-    private suspend fun retryInPlace(fresh: Track, resumeAt: Long) {
+    private suspend fun retryInPlace(fresh: Track, resumeAt: Long, token: PlaybackRecoveryToken) {
+        if (!recoveryReady(token)) return
         val c = controller
         val idx = c?.currentMediaItemIndex ?: -1
         val sameItem = c != null && idx >= 0 && idx < c.mediaItemCount &&
             c.getMediaItemAt(idx).mediaId == fresh.id
-        if (c == null || !sameItem) {
-            // 播放器已经不在这一首上了（用户又切了歌）：退回普通起播
+        if (c == null) return
+        if (!sameItem) {
+            if (c.mediaItemCount != 0) return
             pendingSeekMs = resumeAt
-            startPlayback(fresh, queue.indexOfFirst { it.id == fresh.id }.coerceAtLeast(0), 0)
+            startPlayback(fresh, queueIndex, 0, token)
             return
         }
         // 解码状态跟着新流重置：不 clear 的话旧 error 还挂着，UI 会一直显示错误条
@@ -2166,27 +2983,31 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         }.onFailure {
             DiagLog.log("PLAY_RETRY", "就地替换失败，退回普通起播：${it.message}")
             pendingSeekMs = resumeAt
-            startPlayback(fresh, queue.indexOfFirst { it.id == fresh.id }.coerceAtLeast(0), 0)
+            startPlayback(fresh, queueIndex, 0, token)
         }
         queue.indexOfFirst { it.id == fresh.id }.takeIf { it >= 0 }?.let { queueIndex = it }
         applyLoudness(fresh)
     }
 
     /** 真的起播：交给播放器、更新状态、铺队列、预取下一首 */
-    private suspend fun startPlayback(t: Track, index: Int, skipped: Int) {
+    private suspend fun startPlayback(t: Track, index: Int, skipped: Int,
+                                      token: PlaybackRecoveryToken = recoveryToken(queue.getOrNull(index) ?: t)) {
+        if (!recoveryReady(token)) return
         // APE（Monkey's Audio）暂不支持 —— 识别并提示，不进播放器。
         // 看 playUrl（已解析的直链 / 本地路径 / content URI）的扩展名。
         val playPath = t.playUrl?.lowercase() ?: ""
         if (playPath.endsWith(".ape") || playPath.contains(".ape?")) {
-            toast("APE 格式暂不支持")
             DiagLog.log("PLAY_SKIP", "APE 格式不支持：${t.name}")
-            playbackState = playbackState.copy(buffering = false, error = "APE 格式暂不支持")
+            skipUnsupportedAudio(t)
             return
         }
         val c = readyController() ?: run {
+            if (!recoveryReady(token)) return
             playbackState = playbackState.copy(buffering = false, error = "播放服务未就绪")
             return
         }
+        if (!recoveryReady(token)) return
+        queueFinished = false
         c.setMediaItems(listOf(mediaItemOf(t)), 0, 0L)
         c.prepare()
         c.play()
@@ -2249,6 +3070,9 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      */
     private fun buildQueueAround(anchor: Track) {
         val snapshot = queue
+        val epoch = queueEpoch
+        val mode = playMode
+        queueBuildJob?.cancel()
         val start = snapshot.indexOfFirst { it.id == anchor.id }
         if (start < 0 || snapshot.size <= 1) return
         val shuffle = playMode == PlayMode.SHUFFLE
@@ -2270,7 +3094,11 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 val rest = snapshot.filterNot { laid.contains(it.id) }
                 DiagLog.log("PLAY_QUEUE", "随机模式：全量铺队列 ${rest.size}/${snapshot.size} 首")
                 resolveInOrder(rest) { r ->
-                    if (laid.add(r.id)) controller?.addMediaItem(mediaItemOf(r))
+                    // v2.4.7：判重必须问**当前**的 controller，不能用协程启动时拍的 `laid` 快照。
+                    // prefetchNext / ensureNextInTimeline 会在 resolve 的这几秒里并发追加同一首，
+                    // 快照不知道 → 同一首被加两遍 → timeline 21 项而队列只有 20 首（实测）。
+                    laid.add(r.id)
+                    addToTimelineIfAbsent(r, expectedEpoch = epoch)
                 }
                 val laidNow = controller?.mediaItemCount ?: 0
                 DiagLog.log("PLAY_QUEUE", "随机模式：timeline 现有 $laidNow 首")
@@ -2285,20 +3113,18 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 .filterNot { laid.contains(it.id) }
                 .take(5)
             resolveInOrder(after) { r ->
-                if (laid.add(r.id)) {
-                    controller?.addMediaItem(mediaItemOf(r))
-                }
+                laid.add(r.id)
+                addToTimelineIfAbsent(r, expectedEpoch = epoch)
             }
             // 倒序取最近 3 首：take(3) 作用在倒序列表上 = start-1、start-2、start-3
             DiagLog.log("PLAY_QUEUE", "顺序模式：铺后 ${after.size} 首 + 前 3 首")
             val before = (start - 1 downTo (start - 3)).filter { it >= 0 }.map { snapshot[it] }
                 .filterNot { laid.contains(it.id) }
             resolveInOrder(before) { r ->
-                if (laid.add(r.id)) {
-                    // 倒序迭代 + 固定插到 0 → 最终顺序才是 q[start-3..start-1], cur
-                    // （若插在 currentMediaItemIndex，顺序会反，上一首会跳到队列头部）
-                    controller?.addMediaItem(0, mediaItemOf(r))
-                }
+                laid.add(r.id)
+                // 倒序迭代 + 固定插到 0 → 最终顺序才是 q[start-3..start-1], cur
+                // （若插在 currentMediaItemIndex，顺序会反，上一首会跳到队列头部）
+                addToTimelineIfAbsent(r, at = 0, expectedEpoch = epoch)
             }
         }
     }
@@ -2320,18 +3146,115 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         val nextIndex = nextQueueIndex()
         if (nextIndex !in queue.indices || nextIndex == queueIndex) return
         val next = queue.getOrNull(nextIndex) ?: return
-        if (peekStream(next.id) != null) return       // 已经有能用的直链
+        val epoch = queueEpoch
+        val mode = playMode
+        // v2.4.6：预取窗口从 +1 扩到 +2。
+        //
+        // 只提前一首时，遇到 3 分钟的短歌 + 取链 2 秒，切歌那一下仍会露出空档；
+        // 而且 ensureNextInTimeline 在临近末尾时是**同步等取链**才追加的，
+        // 一旦那一次接口慢，连播就会卡住。多备一首的代价只是多一次 1~3s 的接口调用，
+        // 换来「+1 已经在缓存里、+2 也已经在路上」。
+        //
+        // +2 只写进 streams 缓存，**不进 timeline** —— timeline 由
+        // ensureNextInTimeline 按需续窗，两处都追加会重（v2.4.4 踩过）。
+        val targets = PrefetchWindow.targets(queue.size, queueIndex, nextIndex, loop = mode != PlayMode.ORDER) ?: return
+        val following = queue.getOrNull(targets.following ?: -1)
+        // 解析缓存不等于播放器队列有下一项：缓存只用于省请求，续窗在 ensureNextInTimeline。
         viewModelScope.launch(Dispatchers.IO) {
-            resolveOnce(next) ?: return@launch
+            val resolved = resolveOnce(next) ?: return@launch
             withContext(Dispatchers.Main) {
-                // 解析这一两秒里可能已经切歌/跳曲：只有「它仍是下一首」才算预取成功
-                if (nextQueueIndex() != nextIndex) return@withContext
-                DiagLog.log(
-                    "PLAY_PREFETCH",
-                    "已预取下一首 '${next.name}' → 点下一首可直接起播"
-                )
+                if (queueEpoch != epoch || playMode != mode || nextQueueIndex() != nextIndex ||
+                    queue.getOrNull(nextIndex)?.id != next.id) return@withContext
+                if (controller == null) return@withContext
+                // ⚠️ 必须在**追加这一刻**重新查重，不能用启动协程时算好的 `laid`：
+                // ensureNextInTimeline 可能在这段时间里已经把同一首追加进 timeline，
+                // 于是两处各加一次 → 队列里出现同一首歌两遍（实测日志同一毫秒两条
+                // 「续窗追加 / 预取并追加」都是 '可能'）。
+                if (addToTimelineIfAbsent(resolved.copy(id = next.id), expectedEpoch = epoch)) {
+                    DiagLog.log("PLAY_QUEUE", "预取并追加下一首 '${next.name}' 到播放器队列")
+                } else {
+                    DiagLog.log("PLAY_PREFETCH", "已预取下一首 '${next.name}'")
+                }
+                val item = mediaItemOf(resolved.copy(id = next.id))
+                val local = item.localConfiguration
+                val allowed = cacheSizeGb > 0 && (!wifiOnlyDownload || onWifi()) &&
+                    !(resolved.isMaster && masterWifiOnly && !onWifi()) && AudioRuntimeState.snapshot.desiredPlaying
+                if (local != null) {
+                    com.kmusic.apkhd.playback.AudioPrecacheBridge.replace(
+                        com.kmusic.apkhd.playback.AudioPrecache.Target(local.uri.toString(), local.customCacheKey,
+                            epoch, resolved.sourceBytes), allowed)
+                }
+            }
+            // +2 只热缓存。放在 +1 之后做：万一酷我限流，先保证真正要播的那首拿到链。
+            if (following != null && queueEpoch == epoch && playMode == mode) {
+                val warmed = resolveOnce(following) ?: return@launch
+                DiagLog.log("PLAY_PREFETCH", "预热 +2 '${warmed.name}'（不追加 timeline）")
             }
         }
+    }
+
+    /**
+     * 顺序模式：保证**当前曲之后一定至少还有一首**铺在 timeline 里。
+     *
+     * v2.4.7 重写。旧实现有三个致命点，合起来就是用户看到的「听了几首歌定住」：
+     *
+     * 1. 判据用 `firstOrNull { mediaId == currentId }` —— timeline 里一旦有重复项
+     *    （预取和续窗并发追加造成），拿到的是**靠前**那个，`currentAt` 偏小，
+     *    判定「还没到末尾、不用补」，于是真的末尾没人补。
+     * 2. 补的只算「当前+1」那一首，它已经在 timeline 里就直接放弃，不会往后看。
+     * 3. 判据是 timeline 的下标差（`currentAt < count-2`），而不是逻辑队列还剩多少。
+     *
+     * 现在改成：**以逻辑队列为准**，向后扫描找第一个没铺过的，铺到「当前之后至少 1 首」为止。
+     * 队列还剩多少由 [queueIndex] 说，跟 timeline 里有几个副本无关。
+     */
+    private fun ensureNextInTimeline(currentId: String) {
+        if (playMode == PlayMode.SHUFFLE || playMode == PlayMode.SINGLE) return
+        val snapshot = queue
+        val epoch = queueEpoch
+        val mode = playMode
+        if (snapshot.size <= 1) return
+        // 逻辑下标为准：currentId 只是校验它还是当前曲，不参与「铺到哪了」的判断
+        val idx = snapshot.indexOfFirst { it.id == currentId }
+        if (idx < 0) return
+        val timelineIds = controller?.let { c -> (0 until c.mediaItemCount).map { c.getMediaItemAt(it).mediaId } }
+            .orEmpty()
+        // 缓冲够用就不动：这里只保证「当前之后至少还有 2 首」，
+        // 不是把整条队列铺满。157 首的队列全铺 = 157 次取链，旧策略故意不做。
+        val upcoming = snapshot.drop(idx + 1).mapTo(HashSet()) { it.id }
+        if (timelineIds.count { it in upcoming } >= 2) return
+        val next = com.kmusic.apkhd.playback.QueueContinuation.nextOutsideWindow(
+            snapshot.size, idx, timelineIds, snapshot.map { it.id }
+        ) ?: return   // 队尾：顺序模式播完即停，不绕回
+        val original = snapshot[next]
+        viewModelScope.launch(Dispatchers.IO) {
+            val fresh = resolveOnce(original, force = true) ?: return@launch
+            withContext(Dispatchers.Main) {
+                if (queueEpoch != epoch || playMode != mode) return@withContext
+                if (addToTimelineIfAbsent(fresh.copy(id = original.id), expectedEpoch = epoch)) {
+                    DiagLog.log("PLAY_QUEUE", "续窗追加 '${original.name}'（逻辑第 ${next + 1}/${snapshot.size} 首）")
+                }
+            }
+        }
+    }
+
+    /**
+     * 安全追加：**在追加这一刻**问 controller 有没有这首，有就不加。
+     *
+     * 以前每个调用点各自写一遍 `(0 until count).any { mediaId == id }`，
+     * buildQueueAround 用的还是协程启动时拍的旧快照 —— 与 prefetch / 续窗并发时
+     * 必然漏判，实测 timeline 21 项而队列 20 首。这里统一收口。
+     *
+     * @return 真的追加了才返回 true
+     */
+    private fun addToTimelineIfAbsent(t: Track, at: Int? = null, expectedEpoch: Long = queueEpoch): Boolean {
+        if (queueEpoch != expectedEpoch || queue.none { it.id == t.id }) return false
+        val c = controller ?: return false
+        val exists = (0 until c.mediaItemCount).any { c.getMediaItemAt(it).mediaId == t.id }
+        if (exists) return false
+        return runCatching {
+            if (at == null) c.addMediaItem(mediaItemOf(t)) else c.addMediaItem(at, mediaItemOf(t))
+            true
+        }.getOrDefault(false)
     }
 
     /**
@@ -2352,7 +3275,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 if (at >= 0) return at
             }
         }
-        return (queueIndex + 1) % queue.size
+        return PrefetchWindow.nextIndex(queue.size, queueIndex, loop = playMode != PlayMode.ORDER)
     }
 
     /** 在酷我按「歌名+歌手」找同一首歌，严格三重校验后返回最优候选 */
@@ -2625,12 +3548,31 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun togglePlay() {
         val p = controller ?: return
+        if (AudioRuntimeState.snapshot.desiredPlaying && (awaitingNetwork || playJob?.isActive == true)) {
+            AudioRuntimeState.recordPauseIntent()
+            cancelPendingPlayback()
+            p.pause()
+            return
+        }
         // 冷启动恢复的这首歌还没交给播放器：按播放 = 从上次的位置接着播。
         // 必须先判这一条 —— 播放器此刻是 STATE_IDLE，落到下面的 broken 分支
         // 会走 play(t, queue) 从头开始，把恢复的位置浪费掉。
         if (restoredPositionMs >= 0L && queue.getOrNull(queueIndex) != null) {
             startRestoredPlayback(autoPlay = true)
             return
+        }
+        // 整条队列已经播完（进度条走满、按钮是三角）：按播放 = 从头重听队列。
+        // 不处理的话 play() 只置 playWhenReady，播放器停在末尾一动不动 —— 又是「点了没反应」。
+        // 单曲循环/循环/随机不该出现已播完，只按顺序模式处理。
+        if (queueFinished || endedParked) {
+            queueFinished = false
+            endedParked = false
+            if (queue.isNotEmpty() && playMode == PlayMode.ORDER) {
+                DiagLog.log("PLAY_ENDED", "队列已播完，用户点播放 → 回到队首重听")
+                queueIndex = 0
+                playCurrent()
+                return
+            }
         }
         val broken = runCatching { p.playerError != null || p.playbackState == Player.STATE_IDLE }
             .getOrDefault(false)
@@ -2645,16 +3587,27 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             }
             return
         }
-        if (p.isPlaying) {
+        // ⚠️ 判「意图」而不是 p.isPlaying（v2.4.8）：
+        // 缓冲时 p.isPlaying 是 false，用户在缓冲中按暂停会被当成「按播放」，
+        // 结果点了没反应（甚至把想听的又拉起来）。playWhenReady 才是用户按下什么。
+        val wantPlay = runCatching { p.playWhenReady }.getOrDefault(p.isPlaying)
+        if (wantPlay) {
+            AudioRuntimeState.recordPauseIntent()
+            cancelPendingPlayback()
             p.pause()
             playbackState = playbackState.copy(isPlaying = false)
         } else {
+            AudioRuntimeState.recordPlayIntent()
             p.play()
             playbackState = playbackState.copy(isPlaying = true)
         }
     }
 
     fun next() {
+        AudioRuntimeState.recordPlayIntent()
+        playJob?.cancel()
+        awaitingNetwork = false
+        offlineWatchdog?.cancel()
         val c = controller
         // 队列已铺进播放器 → 交给播放器切（系统按钮和 App 内按钮走同一条路）
         if (c != null && c.hasNextMediaItem()) {
@@ -2667,6 +3620,10 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun prev() {
+        AudioRuntimeState.recordPlayIntent()
+        playJob?.cancel()
+        awaitingNetwork = false
+        offlineWatchdog?.cancel()
         val c = controller
         if (c != null && c.hasPreviousMediaItem()) {
             c.seekToPreviousMediaItem()
@@ -2680,6 +3637,10 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     /** 从队列面板点选某一条播放 */
     fun playAt(index: Int) {
         if (index !in queue.indices) return
+        AudioRuntimeState.recordPlayIntent()
+        playJob?.cancel()
+        awaitingNetwork = false
+        offlineWatchdog?.cancel()
         queueIndex = index
         val c = controller
         // 已经在播放器播放列表里就直接跳，不用重新解析
@@ -3390,34 +4351,65 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
 
         val am = getApplication<android.app.Application>()
             .getSystemService(AudioManager::class.java)
-        val outRate = am?.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull()
+        val runtime = AudioRuntimeState.snapshot
+        val outRate = runtime.applicationOutput?.takeIf { it.isPcm }?.sampleRate
         val outFrames = am?.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)?.toIntOrNull()
 
         // 「请求的档位」与「实际拿到的」分开显示：
         // 用户点的是「臻品母带」，源站给的可能是 320k —— 不告诉他，等于骗他。
-        val reqLabel = playbackState.track?.qualityLabel?.takeIf { it.isNotBlank() }
+        val cur = playbackState.track
+        val reqLabel = cur?.qualityLabel?.takeIf { it.isNotBlank() }
         val actualKbps = f.bitrate.takeIf { it > 0 }?.div(1000)
-        val downgraded = reqLabel != null && actualKbps != null &&
-            reqLabel.contains("母带") && actualKbps < 500
+        // 标了「母带」实际不到 500k、或标了「无损」实际不到 400k，就是源站在偷偷降档。
+        // 现在按 [Track.qualityRank] 判更准：声称无损/母带、实际 rank 不到 FLAC 就是降档。
+        val downgraded = reqLabel != null && actualKbps != null && (
+            (cur?.qualityRank ?: 0) >= KuwoClient.RANK_FLAC && actualKbps < 400 ||
+                (reqLabel.contains("母带") && actualKbps < 500) ||
+                (reqLabel.contains("无损") && actualKbps < 400)
+            )
+        val codec = f.codecs?.uppercase()
+            ?: f.sampleMimeType?.substringAfter("/")?.uppercase()
+            ?: "未知"
+        // 码率 × 时长估体积：详情面板要能回答「这一首占多少流量」。
+        // 母带 5.4Mbps × 3:30 ≈ 140MB，这个数字比「臻品母带」四个字有说服力。
+        // ExoPlayer 读不到 mflac 容器里的码率（它只认 fmtp/bitrate 元数据），
+        // 所以优先用播放器报的；报不出来就用「源站实测码率」（见 Track.sourceKbps）。
+        val durMs = playbackState.durationMs.takeIf { it > 0 } ?: cur?.durationMs ?: 0L
+        val effectiveKbps = actualKbps ?: cur?.sourceKbps?.takeIf { it > 0 }
+        val estBytes = cur?.sourceBytes?.takeIf { it > 0 }
+            ?: if (effectiveKbps != null && effectiveKbps > 0 && durMs > 0) {
+                effectiveKbps.toLong() * 1000L / 8L * durMs / 1000L
+            } else 0L
         return AudioInfo(
-            codec = f.codecs?.uppercase()
-                ?: f.sampleMimeType?.substringAfter("/")?.uppercase()
-                ?: "未知",
+            codec = codec,
             requestedLabel = reqLabel,
             downgraded = downgraded,
             sampleRate = f.sampleRate.takeIf { it > 0 },
             channels = f.channelCount.takeIf { it > 0 },
-            bitrateKbps = f.bitrate.takeIf { it > 0 }?.div(1000),
+            bitrateKbps = effectiveKbps,
+            bitrateFromSource = actualKbps == null && effectiveKbps != null,
             outSampleRate = outRate,
             outFramesPerBuffer = outFrames,
+            outputDescription = runtime.applicationOutput?.let {
+                if (it.isPcm) "PCM ${it.sampleRate / 1000f} kHz · ${it.channelCount}ch · ${it.encoding}" else "编码输出（非PCM）"
+            },
+            outputDevice = runtime.route?.let { it.deviceTypeName + (it.displayName?.let { n -> " · $n" } ?: "") },
+            offloadStatus = runtime.offloadStatus,
+            usbOutputStatus = usbOutput.statusText + " · " + usbOutput.reasonText,
+            interruptionStatus = runtime.interruptionStatus,
+            truePeakStatus = if (EqProcessor.instance.currentTruePeakActive) "已生效 · 延迟${EqProcessor.instance.currentTruePeakLatencyFrames}帧（有限插值估计）" else "关闭 / 当前旁路",
+            pureAudioMode = runtime.pureAudioModeRequested || runtime.usbHighFidelityRequested,
             bufferedMs = (c.bufferedPosition - c.currentPosition).coerceAtLeast(0),
-            sourceLabel = when (playbackState.track?.source) {
+            sourceLabel = when (cur?.source) {
                 "local" -> "本地文件"
                 "navidrome" -> "Navidrome 直连"
-                "netease" -> "网易云（回退酷我）"
+                "netease" -> "网易云（GD 无损通道）"
                 "migu" -> "咪咕 128k（官方）"
-                else -> "酷我在线流"
-            }
+                "kuwo" -> if ((cur.qualityRank) >= KuwoClient.RANK_MASTER) "酷我（母带通道）" else "酷我在线流"
+                else -> "在线流"
+            },
+            qualityRank = cur?.qualityRank ?: 0,
+            estimatedBytes = estBytes
         )
     }
 
@@ -3448,7 +4440,10 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      * LoudnessEnhancer 只能往上加、不能减，做归一方向是错的。
      */
     private fun applyLoudness(track: Track) {
-        if (loudnessMode == "off") {
+        loudnessJob?.cancel()
+        val epoch = ++loudnessEpoch
+        val mode = loudnessMode
+        if (mode == "off" || audioRuntime.usbHighFidelityRequested) {
             loudnessGainDb = 0f
             loudnessSource = "off"
             runCatching { controller?.volume = 1f }
@@ -3460,16 +4455,22 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             runCatching { controller?.volume = 1f }
             return
         }
-        viewModelScope.launch {
+        loudnessJob = viewModelScope.launch {
             val uri = localLib.trackUri(track)
             val applied = LoudnessNormalizer.resolve(
-                getApplication(), track, uri, loudnessMode, loudnessStore
+                getApplication(), track, uri, mode, loudnessStore
             )
             // 用户可能已经切歌了 —— 只对仍是当前曲目的结果生效
-            if (playbackState.track?.id != track.id) return@launch
+            if (playbackState.track?.id != track.id || epoch != loudnessEpoch || mode != loudnessMode) return@launch
             loudnessGainDb = applied.gainDb
-            loudnessSource = applied.source
-            runCatching { controller?.volume = LoudnessNormalizer.toLinear(applied.gainDb) }
+            loudnessSource = applied.source + ":" + applied.basis
+            val c = controller ?: return@launch
+            val initialVolume = c.volume
+            for (step in 1..10) {
+                if (playbackState.track?.id != track.id || epoch != loudnessEpoch || mode != loudnessMode) return@launch
+                c.volume = initialVolume + (applied.volume - initialVolume) * step / 10f
+                delay(10)
+            }
             DiagLog.log(
                 "LOUD",
                 "归一 '${track.name}' mode=$loudnessMode gain=${"%.2f".format(applied.gainDb)}dB " +
@@ -3579,7 +4580,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         eqEnabled = on
         FxChain.configure(on, eqPreset)
         refreshEqBands()
-        viewModelScope.launch { settings.setEqEnabled(on) }
+        if (!persistActiveProfile()) viewModelScope.launch { settings.setEqEnabled(on) }
     }
 
     fun changeEqPreset(index: Int) {
@@ -3589,6 +4590,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         eqEnabled = true
         FxChain.usePresetMode(index)
         refreshEqBands()
+        if (persistActiveProfile()) return
         viewModelScope.launch {
             settings.setEqPreset(index)
             settings.setEqEnabled(true)
@@ -3608,6 +4610,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         eqEnabled = true
         eqCustom = true
         eqBands = FxChain.bandLevels().toList()
+        persistActiveProfile()
     }
 
     // ---------------- 用户自定义曲线 ----------------
@@ -3708,6 +4711,167 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     /** 省电播放（offload）：开了 PCM 直通 DSP，音效不可用 */
+    var audioOutputMode by mutableStateOf("processed")
+        private set
+    var usbHighFidelity by mutableStateOf(false)
+        private set
+    var usbOutput by mutableStateOf(com.kmusic.apkhd.playback.UsbOutputSnapshot())
+        private set
+    var callAutoResume by mutableStateOf(true)
+        private set
+    var truePeakEnabled by mutableStateOf(false)
+        private set
+    var truePeakCeilingDb by mutableStateOf(-1f)
+        private set
+    var deviceProfiles by mutableStateOf<List<com.kmusic.apkhd.data.DeviceEqProfile>>(emptyList())
+        private set
+    var deviceProfileAuto by mutableStateOf(false)
+        private set
+    var deviceProfileRuntime by mutableStateOf(com.kmusic.apkhd.playback.DeviceEqProfiles.ProfileRuntime())
+        private set
+    private val deviceProfileStore = com.kmusic.apkhd.playback.DeviceEqProfiles.store(getApplication())
+
+    fun changeAudioOutputMode(mode: String) {
+        audioOutputMode = mode
+        audioOffload = mode == "offload"
+        pureAudioMode = mode == "pure"
+        usbHighFidelity = mode == "usb"
+        viewModelScope.launch {
+            settings.setAudioOutputMode(mode)
+            if (mode != "usb") playbackState.track?.let { applyLoudness(it) }
+        }
+        toast("正在切换播放模式，将保留当前歌曲和进度")
+    }
+    fun exitTvPlayback() {
+        if (!com.kmusic.apkhd.ui.tv.TvEnv.isTv(getApplication())) return
+        val current = queue.getOrNull(queueIndex)
+        val position = controller?.currentPosition?.takeIf { it > 0 } ?: restoredPositionMs.takeIf { it >= 0 } ?: playbackState.positionMs
+        AudioRuntimeState.recordPauseIntent(com.kmusic.apkhd.playback.PauseCause.SERVICE_STOPPED)
+        cancelPendingPlayback()
+        persistJob?.cancel()
+        kotlinx.coroutines.runBlocking {
+            kotlinx.coroutines.withTimeoutOrNull(600) {
+                if (current != null && queue.isNotEmpty()) {
+                    snapshotStore.saveQueue(PlaybackSnapshot(queue, current.id, queueIndex, System.currentTimeMillis()))
+                    snapshotStore.savePosition(position)
+                }
+            }
+        }
+        com.kmusic.apkhd.playback.PlaybackSessionExit.requestStop(getApplication())
+    }
+    var audioInterruptionResume by mutableStateOf(true)
+        private set
+    fun changeAudioInterruptionResume(on: Boolean) {
+        audioInterruptionResume = on
+        viewModelScope.launch { settings.setAudioInterruptionResume(on) }
+    }
+
+    fun changeCallAutoResume(on: Boolean) {
+        callAutoResume = on
+        viewModelScope.launch { settings.setCallAutoResume(on) }
+        com.kmusic.apkhd.playback.CallStateMonitor.requestRefresh()
+    }
+    fun changeTruePeakEnabled(on: Boolean) {
+        truePeakEnabled = on
+        FxChain.configureTruePeak(on, truePeakCeilingDb)
+        val profile = deviceProfileRuntime.active
+        viewModelScope.launch {
+            if (profile != null) deviceProfileStore.updateExisting(profile.id) { it.copy(truePeakEnabled = on) } else settings.setTruePeakEnabled(on)
+        }
+    }
+    fun changeTruePeakCeiling(value: Float) {
+        truePeakCeilingDb = value.coerceIn(-6f, -0.5f)
+        FxChain.configureTruePeak(truePeakEnabled, truePeakCeilingDb)
+        val profile = deviceProfileRuntime.active
+        viewModelScope.launch {
+            if (profile != null) deviceProfileStore.updateExisting(profile.id) { it.copy(ceilingDbTp = truePeakCeilingDb) } else settings.setTruePeakCeilingDb(truePeakCeilingDb)
+        }
+    }
+    fun changeDevicePreGain(value: Float) {
+        FxChain.configureDevicePreGain(value)
+        persistActiveProfile()
+    }
+
+    fun changeDeviceProfileAuto(on: Boolean) {
+        viewModelScope.launch { runCatching { deviceProfileStore.setAutoEnabled(on) }.onFailure { toast("档案写入失败，请检查文件或重新授权") } }
+    }
+    fun saveDeviceProfile(name: String, bind: Boolean) {
+        if (name.isBlank()) { toast("请填写档案名称"); return }
+        val evidence = com.kmusic.apkhd.playback.DeviceEqProfiles.identify(getApplication(), audioRuntime.route)
+        if (bind && evidence.bindingKey == null) { toast("尚未确认输出路由，不能绑定设备"); return }
+        val profile = com.kmusic.apkhd.data.DeviceEqProfile(name = name.take(80), bindingKey = if(bind) evidence.bindingKey else null,
+            eqEnabled = FxChain.enabled, bandsMb = FxChain.bandLevels().toList(), bass = FxChain.bassStrength,
+            fxLoudness = FxChain.loudnessGain, preGainDb = FxChain.devicePreGainDb,
+            truePeakEnabled = truePeakEnabled, ceilingDbTp = truePeakCeilingDb)
+        viewModelScope.launch {
+            runCatching { deviceProfileStore.update(profile) }
+                .onSuccess { toast(if(bind && !evidence.perDeviceIdentity) "已保存类别档案，不是单设备身份" else "音效档案已保存") }
+                .onFailure { toast("档案保存失败：不覆盖损坏或未知版本文件") }
+        }
+    }
+    var usbModeAvailable by mutableStateOf(false)
+        private set
+
+    fun refreshOutputCapabilities() {
+        usbModeAvailable = runCatching {
+            getApplication<Application>().getSystemService(android.media.AudioManager::class.java)
+                ?.getDevices(android.media.AudioManager.GET_DEVICES_OUTPUTS)
+                ?.any { com.kmusic.apkhd.playback.UsbOutputPolicy.isUsb(it.type) } == true
+        }.getOrDefault(false)
+    }
+    fun bindDeviceProfile(id: String) {
+        val evidence = com.kmusic.apkhd.playback.DeviceEqProfiles.identify(getApplication(), audioRuntime.route)
+        val key = evidence.bindingKey ?: run { toast("请在播放时连接要使用的设备"); return }
+        viewModelScope.launch {
+            runCatching { deviceProfileStore.updateExisting(id) { it.copy(bindingKey = key) } }
+                .onSuccess { toast(if(evidence.perDeviceIdentity) "已用于当前设备" else "已用于当前输出类别") }
+                .onFailure { toast("方案绑定失败，原方案保留") }
+        }
+    }
+    fun applyDeviceProfile(id: String?) {
+        if (id != null && audioOutputMode != "processed") changeAudioOutputMode("processed")
+        com.kmusic.apkhd.playback.DeviceEqProfiles.selectManual(id)
+        if (id == null) changeDeviceProfileAuto(false)
+    }
+    fun deleteDeviceProfile(id: String) {
+        viewModelScope.launch { runCatching { deviceProfileStore.remove(id) }.onFailure { toast("档案删除失败") } }
+    }
+    fun refreshDeviceIdentity() {
+        com.kmusic.apkhd.playback.DeviceEqProfiles.runtime.value = deviceProfileRuntime.copy(
+            bindingKey = com.kmusic.apkhd.playback.DeviceEqProfiles.identify(getApplication(), audioRuntime.route).bindingKey)
+    }
+    private fun persistActiveProfile(): Boolean {
+        val profile = deviceProfileRuntime.active ?: return false
+        val updated = profile.copy(eqEnabled = FxChain.enabled, bandsMb = FxChain.bandLevels().toList(),
+            bass = FxChain.bassStrength, fxLoudness = FxChain.loudnessGain,
+            preGainDb = FxChain.devicePreGainDb, truePeakEnabled = truePeakEnabled, ceilingDbTp = truePeakCeilingDb)
+        viewModelScope.launch { runCatching { deviceProfileStore.updateExisting(profile.id) { it.copy(
+            eqEnabled = updated.eqEnabled, bandsMb = updated.bandsMb, bass = updated.bass, fxLoudness = updated.fxLoudness,
+            preGainDb = updated.preGainDb, truePeakEnabled = updated.truePeakEnabled, ceilingDbTp = updated.ceilingDbTp)
+        } }.onFailure { toast("音效已修改，但档案保存失败") } }
+        return true
+    }
+
+    var pureAudioMode by mutableStateOf(false)
+        private set
+
+    fun changePureAudioMode(on: Boolean) {
+        pureAudioMode = on
+        if (on) audioOffload = false
+        viewModelScope.launch { settings.setPureAudioMode(on) }
+        toast("纯净PCM设置已保存，重启播放服务后生效；不保证设备最终格式")
+    }
+
+    var bluetoothAutoResume by mutableStateOf(false)
+        private set
+    var audioRuntime by mutableStateOf(AudioRuntimeState.snapshot)
+        private set
+
+    fun changeBluetoothAutoResume(on: Boolean) {
+        bluetoothAutoResume = on
+        viewModelScope.launch { settings.setBluetoothAutoResume(on) }
+    }
+
     var audioOffload by mutableStateOf(false)
         private set
 
@@ -3770,6 +4934,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun changeAudioOffload(on: Boolean) {
         audioOffload = on
+        if (on) pureAudioMode = false
         viewModelScope.launch { settings.setAudioOffload(on) }
         if (on) {
             toast("省电播放已开启，音效将在下次起播时失效")
@@ -3808,13 +4973,13 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     fun changeFxBass(v: Int) {
         fxBass = v.coerceIn(0, 1000)
         pushFx()
-        viewModelScope.launch { settings.setFxBass(fxBass) }
+        if (!persistActiveProfile()) viewModelScope.launch { settings.setFxBass(fxBass) }
     }
 
     fun changeFxLoudness(v: Int) {
         fxLoudness = v.coerceIn(0, 1500)
         pushFx()
-        viewModelScope.launch { settings.setFxLoudness(fxLoudness) }
+        if (!persistActiveProfile()) viewModelScope.launch { settings.setFxLoudness(fxLoudness) }
     }
 
     // ---------------- 搜索增强 ----------------
@@ -3872,16 +5037,24 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     // ---------------- 队列操作 ----------------
 
     /** 加到队列末尾。队列空时直接作为当前曲目（否则点"加入队列"像没反应） */
+    private fun restartPendingSelection(wasPending: Boolean) {
+        if (!wasPending || !AudioRuntimeState.snapshot.desiredPlaying || queue.getOrNull(queueIndex) == null) return
+        if (restoredPositionMs >= 0L) startRestoredPlayback(autoPlay = true) else playCurrent()
+    }
+
     fun addToQueue(track: Track) {
+        val wasPending = playJob?.isActive == true
         if (queue.isEmpty()) {
             play(track)
             return
         }
         queue = queue + track
+        restartPendingSelection(wasPending)
     }
 
     /** 插到当前曲目后面，下一首就播 */
     fun playNext(track: Track) {
+        val wasPending = playJob?.isActive == true
         if (queue.isEmpty()) {
             play(track)
             return
@@ -3890,6 +5063,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         val m = queue.toMutableList()
         m.add(at, track)
         queue = m
+        restartPendingSelection(wasPending)
     }
 
     /** 该曲目在**播放器播放列表**里的位置（未解析则 -1） */
@@ -3907,9 +5081,15 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun removeFromQueue(index: Int) {
         if (index !in queue.indices) return
+        val wasPending = playJob?.isActive == true
         val t = queue[index]
         val at = playlistIndexOf(t.id)
         if (at >= 0) runCatching { controller?.removeMediaItem(at) }
+        if (index == queueIndex && wasPending) {
+            restoredPositionMs = 0L
+            pendingSeekMs = 0L
+            seekTarget = -1L
+        }
         val m = queue.toMutableList().also { it.removeAt(index) }
         queue = m
         when {
@@ -3917,6 +5097,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             index < queueIndex -> queueIndex -= 1
             index == queueIndex -> queueIndex = index.coerceAtMost(m.size - 1)
         }
+        restartPendingSelection(wasPending)
     }
 
     /**
@@ -3925,12 +5106,14 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun moveInQueue(from: Int, to: Int) {
         if (from == to || from !in queue.indices || to !in queue.indices) return
+        val wasPending = playJob?.isActive == true
         val curId = queue.getOrNull(queueIndex)?.id
         val m = queue.toMutableList()
         val moved = m.removeAt(from)
         m.add(to, moved)
         queue = m
         queueIndex = m.indexOfFirst { it.id == curId }
+        restartPendingSelection(wasPending)
 
         val c = controller ?: return
         val fromAt = playlistIndexOf(moved.id)
@@ -4014,12 +5197,16 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      *    等用户按播放（或设置里开了自动接着播）才真正交给播放器。
      */
     private suspend fun restoreLastSession(c: MediaController) {
-        if (queue.isNotEmpty()) return                       // 用户已经先点了歌，别覆盖
+        if (queue.isNotEmpty()) return
+        val restoreQueueEpoch = queueEpoch
+        val restorePlaybackEpoch = AudioRuntimeState.snapshot.playbackEpoch
         val snap = runCatching { snapshotStore.loadQueue() }.getOrNull() ?: return
         val savedPos = runCatching { snapshotStore.loadPosition() }.getOrDefault(0L)
         // 设置项此刻可能还没被 init 里的 collect 收上来，直接读一次最准
         val autoPlay = runCatching { settings.autoResumePlayback.first() }
             .getOrDefault(autoResumePlayback)
+        if (queue.isNotEmpty() || queueEpoch != restoreQueueEpoch ||
+            AudioRuntimeState.snapshot.playbackEpoch != restorePlaybackEpoch) return
 
         // ── 路径 A：播放器里还有东西（服务没死） ──
         val aliveId = runCatching { c.currentMediaItem?.mediaId }.getOrNull()
@@ -4034,9 +5221,13 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             queueIndex = list.indexOfFirst { it.id == aliveId }.coerceAtLeast(0)
             val cur = list[queueIndex]
             val dur = runCatching { c.duration }.getOrDefault(0L).takeIf { it > 0 } ?: cur.durationMs
+            // isPlaying 是「用户意图」——必须取 playWhenReady。
+            // 取 c.isPlaying 的话，恢复时正好在缓冲就会把图标画成「播放」三角，
+            // 用户明明没暂停却看到播放键，接着缓冲完又跳回暂停，也是「乱翻」的一种。
             playbackState = PlaybackState(
                 track = cur,
-                isPlaying = runCatching { c.isPlaying }.getOrDefault(false),
+                isPlaying = runCatching { c.playWhenReady }.getOrDefault(false),
+                audible = runCatching { c.isPlaying }.getOrDefault(false),
                 positionMs = runCatching { c.currentPosition }.getOrDefault(0L),
                 durationMs = dur,
                 buffering = runCatching { c.playbackState == Player.STATE_BUFFERING }.getOrDefault(false),
@@ -4082,7 +5273,10 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             runCatching { resolveOnce(target) }
         }
         if (autoPlay) {
-            delay(60)          // 让 UI 先画出「这首歌 + 进度」，再起播
+            val restoredQueueEpoch = queueEpoch
+            delay(60)
+            if (queueEpoch != restoredQueueEpoch || AudioRuntimeState.snapshot.playbackEpoch != restorePlaybackEpoch ||
+                queue.getOrNull(queueIndex)?.id != target.id || restoredPositionMs != pos) return
             startRestoredPlayback(autoPlay = true)
         }
     }
@@ -4128,11 +5322,13 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     private fun startRestoredPlayback(autoPlay: Boolean) {
         val t = queue.getOrNull(queueIndex) ?: return
         val startAt = restoredPositionMs.coerceAtLeast(0L)
-        restoredPositionMs = -1L
+        if (autoPlay) AudioRuntimeState.recordPlayIntent()
+        val token = recoveryToken(t)
         playJob?.cancel()
         playJob = viewModelScope.launch {
             playbackState = playbackState.copy(track = t, buffering = true, error = null)
             val resolved = resolveOnce(t)
+            if (!recoveryReady(token)) return@launch
             if (resolved == null) {
                 playbackState = playbackState.copy(
                     buffering = false,
@@ -4141,23 +5337,27 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 toast("上次的歌曲暂时取不到音源")
                 // 取不到就退回「把位置存着」，下次还能再试
-                restoredPositionMs = startAt
+                if (restoredPositionMs < 0L) restoredPositionMs = startAt
                 return@launch
             }
             val c = readyController() ?: run {
+                if (!recoveryReady(token)) return@launch
                 playbackState = playbackState.copy(buffering = false, error = "播放服务未就绪")
-                restoredPositionMs = startAt
+                if (restoredPositionMs < 0L) restoredPositionMs = startAt
                 return@launch
             }
+            if (!recoveryReady(token)) return@launch
+            val resumeAt = restoredPositionMs.takeIf { it >= 0L } ?: startAt
+            restoredPositionMs = -1L
             watchRestore()
-            c.setMediaItems(listOf(mediaItemOf(resolved)), 0, startAt)
+            c.setMediaItems(listOf(mediaItemOf(resolved)), 0, resumeAt)
             c.prepare()
             if (autoPlay) c.play()
             // seek 交给 pendingSeekMs：READY 之后才真正落位（setMediaItems 的起始位置
             // 在部分机型上会被 prepare 过程重置，显式 seek 一次最稳）
-            if (startAt > 0L) {
-                pendingSeekMs = startAt
-                seekTarget = startAt
+            if (resumeAt > 0L) {
+                pendingSeekMs = resumeAt
+                seekTarget = resumeAt
                 seekGuardUntil = android.os.SystemClock.elapsedRealtime() + 3_000
             }
             playbackState = playbackState.copy(
@@ -4165,14 +5365,14 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 isPlaying = autoPlay,
                 buffering = true,
                 error = null,
-                positionMs = startAt,
+                positionMs = resumeAt,
                 durationMs = if (resolved.durationMs > 0) resolved.durationMs else playbackState.durationMs
             )
             applyLoudness(resolved)
             loadLyrics(resolved)
             buildQueueAround(resolved)
             prefetchNext()
-            DiagLog.log("RESUME", "从 ${startAt}ms 接着播 '${resolved.name}' autoPlay=$autoPlay")
+            DiagLog.log("RESUME", "从 ${resumeAt}ms 接着播 '${resolved.name}' autoPlay=$autoPlay")
         }
     }
 
@@ -4207,9 +5407,18 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
 
     fun changePlayMode(mode: PlayMode) {
         val wasShuffle = playMode == PlayMode.SHUFFLE
+        val wasPending = playJob?.isActive == true
+        if (mode != playMode) {
+            queueEpoch++
+            queueEpochUpdates.value = queueEpoch
+            playJob?.cancel()
+            com.kmusic.apkhd.playback.AudioPrecacheBridge.updateQueueEpoch(queueEpoch)
+            queueBuildJob?.cancel()
+        }
         playMode = mode
         controller?.let { applyPlayMode(it) }
         viewModelScope.launch { settings.setPlayMode(mode) }
+        restartPendingSelection(wasPending)
         // 顺序模式下播放器里只铺了 9 首；切到随机时若不补齐，shuffle 仍只在这 9 首里打转。
         // 垫一首当前曲目触发 buildQueueAround 全量铺（幂等：已在 timeline 的不会重复加）。
         if (mode == PlayMode.SHUFFLE && !wasShuffle) {
@@ -4245,13 +5454,16 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun refreshCacheSize() {
+        refreshOutputCapabilities()
         cacheBytes = com.kmusic.apkhd.playback.MediaCache.sizeBytes(getApplication())
     }
 
     fun clearMediaCache() {
-        com.kmusic.apkhd.playback.MediaCache.clear()
+        com.kmusic.apkhd.playback.AudioPrecacheBridge.cancel()
+        val result = com.kmusic.apkhd.playback.MediaCache.clear()
         refreshCacheSize()
-        toast("缓存已清空（正在播放的歌曲会继续缓存）")
+        toast(if (result.successful) "缓存已清空（正在播放的歌曲会继续缓存）"
+            else "部分缓存未清除：${result.failures}项；稍后重试")
     }
 
     /** 切音质后要跳回的位置（毫秒），新流 READY 时消费掉 */
@@ -4277,7 +5489,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         client.resetQualityProbe()
         // ⚠️ 必须把这首的缓存删掉：playCurrent 现在优先用预取/已解析的结果，
         // 留着旧条目就会拿**旧码率**的直链「重播」一遍，用户听到的还是原来的音质。
-        streams.remove(t.id)
+        streams.remove(streamKey(t))
         pendingSeekMs = controller?.currentPosition ?: 0L
         playCurrent()
     }
@@ -4298,6 +5510,24 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { settings.setWifiOnlyDownload(on) }
     }
 
+    /** 母带仅在 Wi-Fi 下播放（默认关：流量也照播母带）。开了就在布局里少一行负缓存探测。 */
+    var masterWifiOnly by mutableStateOf(false)
+        private set
+
+    fun changeMasterWifiOnly(on: Boolean) {
+        masterWifiOnly = on
+        viewModelScope.launch { settings.setMasterWifiOnly(on) }
+        // 换成「不限流量」时，之前因流量被封存的母带探测要能重新来一遍
+        if (!on) neToKuwo.clear()
+        // 当前这首如果正在放 GD 无损、而现在是 Wi-Fi 了，按新设置重取一次
+        val t = queue.getOrNull(queueIndex) ?: return
+        if (t.source == "netease" && defaultQuality == "master") {
+            streams.remove(streamKey(t))
+            pendingSeekMs = controller?.currentPosition ?: 0L
+            playCurrent()
+        }
+    }
+
     // ---------------- 下载 ----------------
 
     // ---------------- 一次性用户提示（Toast） ----------------
@@ -4308,15 +5538,15 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
      * 用自增 seq 而不是裸字符串：同一句话连点两次也要能再弹一次（内容相同否则会被
      * Compose 当成没变化）。UI 读完调 [consumeUserMessage] 清掉。
      */
-    data class UserMessage(val seq: Long, val text: String)
+    data class UserMessage(val seq: Long, val text: String, val long: Boolean = false)
 
     var userMessage by mutableStateOf<UserMessage?>(null)
         private set
     private var msgSeq = 0L
 
-    private fun toast(text: String) {
+    private fun toast(text: String, long: Boolean = false) {
         msgSeq += 1
-        userMessage = UserMessage(msgSeq, text)
+        userMessage = UserMessage(msgSeq, text, long)
     }
 
     fun consumeUserMessage() {
@@ -4395,14 +5625,16 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                     DownloadCenter.enqueue(track, url, null, "无损", "")
                 }
                 "netease" -> {
-                    // 与播放同策略：先酷我母带（三重校验通过才用），否则网易云直链
-                    val best = matchOnKuwo(track)
-                    if (best != null) {
-                        enqueueFromKuwo(best.rid, track)
+                    // 与播放**同一条策略**（v2.4.10）：走 neteaseResolved，母带优先、只升不降。
+                    // 以前这里是手写的一份相反逻辑（先酷我、不看音质档位），
+                    // 导致「同一首歌，播放是无损、下载却是母带」。
+                    val got = neteaseResolved(track)
+                        ?: throw IllegalStateException("酷我无匹配、GD 取链失败")
+                    val ekey = got.ekey
+                    if (ekey != null) {
+                        DownloadCenter.enqueue(got, got.playUrl!!, ekey, got.qualityLabel, client.userTag)
                     } else {
-                        val direct = runCatching { gd.url(track.sourceId) }.getOrNull()
-                            ?: throw IllegalStateException("酷我无匹配、网易云取链失败")
-                        DownloadCenter.enqueue(track, direct, null, "无损", "")
+                        DownloadCenter.enqueue(got, got.playUrl!!, null, got.qualityLabel, "")
                     }
                 }
                 else -> enqueueFromKuwo(track.sourceId, track)
@@ -4415,7 +5647,9 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
     private suspend fun enqueueFromKuwo(rid: String, track: Track) {
         val r = resolveByTier(rid)
             ?: throw IllegalStateException("没有符合当前音质设置的可下载资源")
-        DownloadCenter.enqueue(track, r.url, r.ekey, qualityLabel(r.br), client.userTag)
+        // 标签与播放一致：按响应里的真实格式/码率写（v2.4.10）
+        val label = KuwoClient.labelOf(r.format, r.kbps) ?: qualityLabel(r.br)
+        DownloadCenter.enqueue(track, r.url, r.ekey, label, client.userTag)
     }
 
     fun removeDownload(id: String) = DownloadCenter.remove(id)
@@ -4564,25 +5798,20 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         val ctx = getApplication<Application>()
-        val token = SessionToken(ctx, ComponentName(ctx, MoyinPlaybackService::class.java))
-        controllerFuture = MediaController.Builder(ctx, token).buildAsync().also { f ->
-            f.addListener({
-                runCatching { f.get() }
-                    .onSuccess {
-                        controller = it
-                        attachControllerListener(it)
-                        applyPlayMode(it)
-                        // 接上上次的播放：队列 + 当前曲 + 进度。
-                        // 播放器还活着就以它为准，真冷启动则只摆 UI、等用户按播放
-                        // （或设置里开了「自动接着播」）。
-                        viewModelScope.launch {
-                            runCatching { restoreLastSession(it) }
-                                .onFailure { e -> Log.w("MoyinVM", "恢复上次播放失败: ${e.message}") }
-                        }
-                    }
-                    .onFailure { Log.w("MoyinVM", "控制器连接失败: ${it.message}") }
-            }, ContextCompat.getMainExecutor(ctx))
-        }
+        // 网络边沿监听：断网时停在当前曲，恢复后自动续播（v2.4.6）
+        networkMonitor.start(
+            onRegained = { onNetworkRegained() },
+            onLost = {
+                // 只是记一笔：真正的「停播等网」由播放器报错时判定，
+                // 缓存里还剩几十秒音频的场景不该被我们提前打断。
+            },
+            onChanged = {
+                com.kmusic.apkhd.playback.AudioPrecacheBridge.cancel()
+                if (AudioRuntimeState.snapshot.desiredPlaying && !networkMonitor.isOffline()) prefetchNext()
+            }
+        )
+        startPlayGuard()
+        connectController()
 
     }
 
@@ -4615,7 +5844,7 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { settings.aiEndpoint.collect { aiEndpoint = it } }
         viewModelScope.launch { settings.aiApiKey.collect { aiApiKey = it } }
         viewModelScope.launch { settings.aiModel.collect { aiModel = it } }
-        viewModelScope.launch { settings.eqEnabled.collect { eqEnabled = it; FxChain.configure(it, eqPreset) } }
+        viewModelScope.launch { settings.eqEnabled.collect { if (deviceProfileRuntime.active == null) { eqEnabled = it; FxChain.configure(it, eqPreset) } } }
         viewModelScope.launch {
             settings.eqPreset.collect { raw ->
                 // 老版本存的是**设备预设下标**（0..9），现在换成了内置表。
@@ -4627,14 +5856,16 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                         if (m != raw) viewModelScope.launch { settings.setEqPreset(m) }
                     }
                 }
-                eqPreset = idx
-                FxChain.configure(eqEnabled, idx)
+                if (deviceProfileRuntime.active == null) {
+                    eqPreset = idx
+                    FxChain.configure(eqEnabled, idx)
+                }
                 refreshEqBands()
             }
         }
         reloadUserPresets()
-        viewModelScope.launch { settings.fxBass.collect { fxBass = it; pushFx() } }
-        viewModelScope.launch { settings.fxLoudness.collect { fxLoudness = it; pushFx() } }
+        viewModelScope.launch { settings.fxBass.collect { if (deviceProfileRuntime.active == null) { fxBass = it; pushFx() } } }
+        viewModelScope.launch { settings.fxLoudness.collect { if (deviceProfileRuntime.active == null) { fxLoudness = it; pushFx() } } }
         // 处理器是普通对象（不是 Compose State），靠版本号把它报上来的运行态
         // （采样率 / 开了几项）同步到界面。没有「重建链」这回事，所以这里只读不推。
         viewModelScope.launch {
@@ -4659,6 +5890,10 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { settings.defaultQuality.collect { defaultQuality = it } }
         viewModelScope.launch { settings.cacheSizeGb.collect { cacheSizeGb = it } }
         viewModelScope.launch { settings.losslessFallback.collect { losslessFallback = it } }
+        viewModelScope.launch { settings.masterWifiOnly.collect {
+            masterWifiOnly = it
+            if (it) com.kmusic.apkhd.playback.AudioPrecacheBridge.cancel()
+        } }
         viewModelScope.launch {
             settings.loudnessMode.collect { m ->
                 if (m != loudnessMode) {
@@ -4668,6 +5903,27 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         viewModelScope.launch { settings.audioOffload.collect { audioOffload = it } }
+        viewModelScope.launch { settings.pureAudioMode.collect { pureAudioMode = it } }
+        viewModelScope.launch { settings.audioOutputMode.collect { audioOutputMode = it } }
+        viewModelScope.launch { settings.usbHighFidelity.collect { usbHighFidelity = it } }
+        viewModelScope.launch { settings.callAutoResume.collect { callAutoResume = it } }
+        viewModelScope.launch { settings.audioInterruptionResume.collect { audioInterruptionResume = it } }
+        viewModelScope.launch { settings.truePeakEnabled.collect { if(deviceProfileRuntime.active == null) { truePeakEnabled = it; FxChain.configureTruePeak(it, truePeakCeilingDb) } } }
+        viewModelScope.launch { settings.truePeakCeilingDb.collect { if(deviceProfileRuntime.active == null) { truePeakCeilingDb = it; FxChain.configureTruePeak(truePeakEnabled, it) } } }
+        viewModelScope.launch { com.kmusic.apkhd.playback.UsbAudioRuntime.state.collect { usbOutput = it } }
+        viewModelScope.launch { deviceProfileStore.profiles.collect { deviceProfiles = it } }
+        viewModelScope.launch { deviceProfileStore.autoEnabled.collect { deviceProfileAuto = it } }
+        viewModelScope.launch {
+            com.kmusic.apkhd.playback.DeviceEqProfiles.runtime.collect {
+                deviceProfileRuntime = it
+                eqEnabled = FxChain.enabled
+                fxBass = FxChain.bassStrength
+                fxLoudness = FxChain.loudnessGain
+                it.active?.let { profile -> truePeakEnabled = profile.truePeakEnabled; truePeakCeilingDb = profile.ceilingDbTp }
+                refreshEqBands()
+            }
+        }
+        viewModelScope.launch { settings.bluetoothAutoResume.collect { bluetoothAutoResume = it } }
         viewModelScope.launch { settings.dsdOutRate.collect { dsdOutRate = it } }
         viewModelScope.launch { settings.dsdBypassEq.collect { dsdBypassEq = it } }
         // DSD 播放状态：音效链旁路 EQ 时也要同步界面
@@ -4676,7 +5932,10 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
             dsdLabel = DsdPlaybackState.currentLabel
             FxChain.setDsdBypass(dsdBypassEq && dsdPlaying)
         }
-        viewModelScope.launch { settings.wifiOnlyDownload.collect { wifiOnlyDownload = it } }
+        viewModelScope.launch { settings.wifiOnlyDownload.collect {
+            wifiOnlyDownload = it
+            if (it) com.kmusic.apkhd.playback.AudioPrecacheBridge.cancel()
+        } }
         viewModelScope.launch { settings.lyricOffsetMs.collect { lyricOffsetMs = it } }
         viewModelScope.launch { settings.lyricFontScale.collect { lyricFontScale = it } }
         // WebDAV 凭据：变化就重建客户端，顺手把鉴权上下文交给播放器数据源
@@ -4723,6 +5982,25 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                 if (navidromeConnected) refreshNavidrome()
             }
         }
+        viewModelScope.launch {
+            AudioRuntimeState.updates.collect { runtime ->
+                if (runtime.usbHighFidelityRequested && !audioRuntime.usbHighFidelityRequested) {
+                    loudnessJob?.cancel()
+                    loudnessEpoch++
+                    runCatching { controller?.volume = 1f }
+                    loudnessGainDb = 0f
+                    loudnessSource = "usb-bypassed"
+                }
+                audioRuntime = runtime
+                refreshOutputCapabilities()
+                if (!runtime.desiredPlaying && !runtime.modeSwitching) cancelPendingPlayback()
+                if (!runtime.serviceAlive && com.kmusic.apkhd.ui.tv.TvEnv.isTv(getApplication()) && com.kmusic.apkhd.playback.PlaybackSessionExit.isExitRequested) {
+                    controllerFuture?.let { MediaController.releaseFuture(it) }
+                    controllerFuture = null
+                    controller = null
+                }
+            }
+        }
         // 播放进度轮询（驱动进度条和歌词高亮）
         var lastPersistAt = 0L
         viewModelScope.launch {
@@ -4750,16 +6028,38 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                         if (it > 0) it else playbackState.durationMs
                     }
                     if (playbackState.track != null) {
-                        val playing = runCatching { p.isPlaying }.getOrDefault(false)
+                        // ⚠️ 这里只同步「真实出声」和「缓冲」两个物理事实（v2.4.8）。
+                        // 绝不能拿 p.isPlaying 去写 playbackState.isPlaying ——
+                        // 那个字段现在是「用户意图」（= playWhenReady），
+                        // 被缓冲状态覆盖的话图标就会跟着网络抖动闪。
+                        val audible = runCatching { p.isPlaying }.getOrDefault(false)
+                        val buffering = runCatching { p.playbackState == Player.STATE_BUFFERING }
+                            .getOrDefault(false)
+                        val nowElapsed = android.os.SystemClock.elapsedRealtime()
+                        if (buffering) {
+                            if (bufferingSince == 0L) bufferingSince = nowElapsed
+                        } else {
+                            bufferingSince = 0L
+                        }
+                        val stalled = bufferingSince != 0L && nowElapsed - bufferingSince >= STALL_HINT_MS
+                        if (stalled && !playbackState.stalled) {
+                            DiagLog.log(
+                                "PLAY_BUF",
+                                "缓冲已持续 ${(nowElapsed - bufferingSince) / 1000}s，叠加载圈（图标保持「暂停」）"
+                            )
+                        }
                         // mutableStateOf 的结构相等策略会挡住无变化的写入；这里显式比一次
                         // 只是省掉 10Hz 的 copy 分配（暂停时尤其明显）
                         if (pos != playbackState.positionMs || dur != playbackState.durationMs ||
-                            playing != playbackState.isPlaying
+                            audible != playbackState.audible || buffering != playbackState.buffering ||
+                            stalled != playbackState.stalled
                         ) {
                             playbackState = playbackState.copy(
                                 positionMs = pos,
                                 durationMs = dur,
-                                isPlaying = playing
+                                audible = audible,
+                                buffering = buffering,
+                                stalled = stalled
                             )
                         }
                         // 歌词高亮：只在换行时更新状态，别让整个列表跟着 100ms 抖
@@ -4780,7 +6080,50 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private fun connectController() {
+        if (controller?.isConnected == true || controllerFuture?.isDone == false) return
+        if (com.kmusic.apkhd.ui.tv.TvEnv.isTv(getApplication()) && com.kmusic.apkhd.playback.PlaybackSessionExit.isExitRequested) return
+        val ctx = getApplication<Application>()
+        val token = SessionToken(ctx, ComponentName(ctx, MoyinPlaybackService::class.java))
+        controllerFuture = MediaController.Builder(ctx, token).setListener(object : MediaController.Listener {
+            override fun onDisconnected(disconnected: MediaController) {
+                if (controller === disconnected) controller = null
+                controllerFuture = null
+            }
+        }).buildAsync().also { f ->
+            f.addListener({
+                runCatching { f.get() }
+                    .onSuccess {
+                        controller = it
+                        attachControllerListener(it)
+                        applyPlayMode(it)
+                        // 接上上次的播放：队列 + 当前曲 + 进度。
+                        // 播放器还活着就以它为准，真冷启动则只摆 UI、等用户按播放
+                        // （或设置里开了「自动接着播」）。
+                        viewModelScope.launch {
+                            if (queue.isNotEmpty() && com.kmusic.apkhd.ui.tv.TvEnv.isTv(ctx)) return@launch
+                            runCatching { restoreLastSession(it) }
+                                .onFailure { e -> Log.w("MoyinVM", "恢复上次播放失败: ${e.message}") }
+                        }
+                    }
+                    .onFailure { Log.w("MoyinVM", "控制器连接失败: ${it.message}") }
+            }, ContextCompat.getMainExecutor(ctx))
+        }
+    }
+
+    fun onUiForeground() {
+        if (!com.kmusic.apkhd.ui.tv.TvEnv.isTv(getApplication())) return
+        com.kmusic.apkhd.playback.PlaybackSessionExit.openSession()
+        refreshOutputCapabilities()
+        connectController()
+    }
+
     override fun onCleared() {
+        networkMonitor.stop()
+        offlineWatchdog?.cancel()
+        offlineWatchdog = null
+        playGuard?.cancel()
+        playGuard = null
         // 只断开与服务的连接；播放继续（前台服务活着），重进 App 会自动重连
         controllerFuture?.let { MediaController.releaseFuture(it) }
         controller = null
@@ -4805,6 +6148,25 @@ data class AudioInfo(
     val bitrateKbps: Int?,
     val outSampleRate: Int?,
     val outFramesPerBuffer: Int?,
+    val outputDescription: String? = null,
+    val outputDevice: String? = null,
+    val offloadStatus: String = "未知",
+    val usbOutputStatus: String = "关闭",
+    val interruptionStatus: String = "等待音频中断",
+    val truePeakStatus: String = "关闭",
+    val pureAudioMode: Boolean = false,
     val bufferedMs: Long,
-    val sourceLabel: String
+    val sourceLabel: String,
+    /** 实际音质分级，用于在详情里显示「母带 / 无损 / 320k」的真实档位 */
+    val qualityRank: Int = 0,
+    /** 单曲体积（字节，按码率 × 时长估算），用来显示「这首多大」 */
+    val estimatedBytes: Long = 0L,
+    /**
+     * [bitrateKbps] 是源站报的，不是解码器实测的。
+     *
+     * mflac / mgg 这些加密容器，ExoPlayer 读不到码率（Format.bitrate = -1），
+     * 只能拿取链响应里的 `bitrate` 兜底。界面上要标出来 ——
+     * 「5426 kbps（源站标称）」和「5426 kbps」的可信度不是一回事。
+     */
+    val bitrateFromSource: Boolean = false
 )
