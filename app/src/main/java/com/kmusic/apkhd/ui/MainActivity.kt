@@ -60,6 +60,7 @@ import com.kmusic.apkhd.ui.screens.ProfileScreen
 import com.kmusic.apkhd.ui.screens.SearchScreen
 import com.kmusic.apkhd.ui.screens.LocalFoldersScreen
 import com.kmusic.apkhd.ui.screens.MyPlaylistsScreen
+import com.kmusic.apkhd.ui.screens.NavidromeScreen
 import com.kmusic.apkhd.ui.screens.TrackListScreen
 import com.kmusic.apkhd.ui.screens.WrongLyricSheet
 import com.kmusic.apkhd.ui.theme.LocalMoyinColors
@@ -176,6 +177,7 @@ private sealed interface Route {
     /** 自建歌单详情 */
     data class UserPlaylistRoute(val id: String) : Route
     data class NdPlaylist(val id: String, val name: String) : Route
+    data object Navidrome : Route
     data object NavidromeAlbums : Route
     data object NavidromeArtists : Route
     data object NavidromePlaylists : Route
@@ -602,6 +604,24 @@ fun MoyinRoot() {
                             },
                             onBack = { route = Route.None }
                         )
+                        is Route.Navidrome -> NavidromeScreen(
+                            url = vm.navidromeAddress,
+                            connected = vm.navidromeConnected,
+                            checking = vm.navidromeChecking,
+                            error = vm.navidromeError,
+                            trackCount = vm.navidromeTrackCount,
+                            albumCount = vm.navidromeAlbums.size,
+                            artistCount = vm.navidromeArtists.size,
+                            playlistCount = vm.navidromePlaylists.size,
+                            onOpenAlbums = { vm.refreshNavidrome(); route = Route.NavidromeAlbums },
+                            onOpenArtists = { vm.refreshNavidrome(); route = Route.NavidromeArtists },
+                            onOpenPlaylists = { vm.refreshNavidrome(); route = Route.NavidromePlaylists },
+                            onReconnect = { vm.retryNavidrome() },
+                            onRefresh = { vm.refreshNavidrome() },
+                            onOpenSettings = { tab = 3; route = Route.None },
+                            onBack = { route = Route.None },
+                            bottomInsetDp = if (vm.playbackState.track != null) 72 else 0
+                        )
                         is Route.NavidromeAlbums -> CollectionListScreen(
                             title = "专辑",
                             items = vm.albumItems,
@@ -785,6 +805,11 @@ fun MoyinRoot() {
                                 davConfigured = vm.davConfigured,
                                 davPath = vm.davPath.removePrefix(vm.davUrl).trim('/'),
                                 onWebDavClick = { route = Route.WebDav },
+                                ndConfigured = vm.navidromeAddress.isNotBlank(),
+                                ndConnected = vm.navidromeConnected,
+                                ndTrackCount = vm.navidromeTrackCount,
+                                ndError = vm.navidromeError,
+                                onNavidromeClick = { route = Route.Navidrome },
                                 downloadCount = vm.downloads.size,
                                 onCategoryClick = { cat ->
                                     if (cat == "下载管理") route = Route.Downloads
@@ -815,6 +840,16 @@ fun MoyinRoot() {
                                 davDiagText = vm.davDiagText,
                                 davDiagRunning = vm.davDiagRunning,
                                 onDiagnoseDav = vm::davDiagnose,
+                                ndUrl = vm.navidromeAddress,
+                                ndUser = vm.navidromeUser,
+                                ndPass = vm.navidromePass,
+                                ndConnected = vm.navidromeConnected,
+                                ndChecking = vm.navidromeChecking,
+                                ndError = vm.navidromeError,
+                                ndTrackCount = vm.navidromeTrackCount,
+                                onSaveNavidrome = vm::saveNavidrome,
+                                onTestNavidrome = { vm.recheckNavidrome() },
+                                onClearNavidrome = { vm.clearNavidrome() },
                                 lastPlayError = vm.lastPlayError,
                                 defaultQuality = vm.defaultQuality,
                                 onQualityChange = vm::changeQuality,

@@ -99,6 +99,17 @@ fun ProfileScreen(
     davDiagRunning: Boolean = false,
     onDiagnoseDav: () -> Unit = {},
     lastPlayError: String = "",
+    // Navidrome（Subsonic 协议曲库）
+    ndUrl: String = "",
+    ndUser: String = "",
+    ndPass: String = "",
+    ndConnected: Boolean = false,
+    ndChecking: Boolean = false,
+    ndError: String? = null,
+    ndTrackCount: Int = 0,
+    onSaveNavidrome: (String, String, String) -> Unit = { _, _, _ -> },
+    onTestNavidrome: () -> Unit = {},
+    onClearNavidrome: () -> Unit = {},
     defaultQuality: String,
     onQualityChange: (String) -> Unit,
     losslessFallback: Boolean,
@@ -215,6 +226,11 @@ fun ProfileScreen(
     var davUserLocal by remember(davUser) { mutableStateOf(davUser) }
     var davPassLocal by remember(davPass) { mutableStateOf(davPass) }
     var davEditing by remember { mutableStateOf<String?>(null) }
+    // Navidrome 编辑缓存：同样三项一起存，避免只存半套配置
+    var ndUrlLocal by remember(ndUrl) { mutableStateOf(ndUrl) }
+    var ndUserLocal by remember(ndUser) { mutableStateOf(ndUser) }
+    var ndPassLocal by remember(ndPass) { mutableStateOf(ndPass) }
+    var ndEditing by remember { mutableStateOf<String?>(null) }
     var darkStyleExpanded by remember { mutableStateOf(false) }
     // 分组折叠：设置页太长，外观/音效默认展开，点标题可收起
     var appearanceOpen by remember { mutableStateOf(true) }
@@ -564,6 +580,93 @@ fun ProfileScreen(
             }
         }
 
+        }
+
+        // ── Navidrome（Subsonic 曲库）──────────────────────────
+        item {
+            SectionHeader(
+                text = "Navidrome 曲库",
+                modifier = Modifier.padding(top = 16.wdp)
+            )
+        }
+        item {
+            SettingRow(
+                title = "服务器地址",
+                subtitle = ndUrlLocal.ifEmpty { "未配置，例如 http://192.168.1.10:4533" },
+                onClick = { ndEditing = "url" }
+            )
+        }
+        item {
+            SettingRow(
+                title = "用户名",
+                subtitle = ndUserLocal.ifEmpty { "未填写" },
+                onClick = { ndEditing = "user" }
+            )
+        }
+        item {
+            SettingRow(
+                title = "密码",
+                subtitle = if (ndPassLocal.isEmpty()) "未填写" else "已保存（点此修改）",
+                onClick = { ndEditing = "pass" }
+            )
+        }
+        item {
+            SettingRow(
+                title = "连接状态",
+                subtitle = when {
+                    ndUrlLocal.isBlank() -> "填好地址后保存即可连接"
+                    ndChecking -> "正在连接…"
+                    ndConnected -> "已连接 · $ndTrackCount 首"
+                    ndError != null -> ndError
+                    else -> "已配置，未连接"
+                },
+                value = if (ndChecking) "…" else "测试",
+                onClick = onTestNavidrome
+            )
+        }
+        if (ndUrlLocal.isNotBlank()) {
+            item {
+                SettingRow(
+                    title = "断开曲库",
+                    subtitle = "清除已保存的服务器与账号",
+                    value = "断开",
+                    onClick = { onClearNavidrome() }
+                )
+            }
+        }
+        if (ndEditing != null) {
+            item {
+                val editing = ndEditing
+                AiInputDialog(
+                    title = when (editing) {
+                        "url" -> "Navidrome 地址"
+                        "user" -> "Navidrome 用户名"
+                        else -> "Navidrome 密码"
+                    },
+                    initial = when (editing) {
+                        "url" -> ndUrlLocal
+                        "user" -> ndUserLocal
+                        else -> ndPassLocal
+                    },
+                    hint = when (editing) {
+                        "url" -> "http://host:4533（不要带 /rest）"
+                        "user" -> "Navidrome 登录用户名"
+                        else -> "Navidrome 登录密码"
+                    },
+                    mask = editing == "pass",
+                    onDismiss = { ndEditing = null },
+                    onConfirm = { v ->
+                        val u = if (editing == "url") v.trim() else ndUrlLocal
+                        val us = if (editing == "user") v.trim() else ndUserLocal
+                        val pw = if (editing == "pass") v else ndPassLocal
+                        ndUrlLocal = u; ndUserLocal = us; ndPassLocal = pw
+                        if (u.isNotBlank() && us.isNotBlank() && pw.isNotBlank()) {
+                            onSaveNavidrome(u, us, pw)
+                        }
+                        ndEditing = null
+                    }
+                )
+            }
         }
 
         item { SectionHeader(text = "播放与音质", modifier = Modifier.padding(top = 16.wdp)) }

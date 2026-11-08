@@ -53,6 +53,12 @@ fun LibraryScreen(
     davConfigured: Boolean = false,
     davPath: String = "",
     onWebDavClick: () -> Unit = {},
+    /** Navidrome 曲库：未配置 / 已连接（附曲目数）/ 连接失败 */
+    ndConfigured: Boolean = false,
+    ndConnected: Boolean = false,
+    ndTrackCount: Int = 0,
+    ndError: String? = null,
+    onNavidromeClick: () -> Unit = {},
     onCategoryClick: (String) -> Unit,
     downloadCount: Int = 0,
     modifier: Modifier = Modifier
@@ -131,6 +137,19 @@ fun LibraryScreen(
                     else -> "已连接 · $davPath"
                 },
                 onClick = onWebDavClick
+            )
+        }
+        item {
+            LibraryEntry(
+                icon = IconServer,
+                title = "Navidrome",
+                subtitle = when {
+                    !ndConfigured -> "未配置，点此填写服务器"
+                    ndConnected -> "已连接 · $ndTrackCount 首"
+                    !ndError.isNullOrBlank() -> "连接失败，点此查看"
+                    else -> "已配置，未连接"
+                },
+                onClick = onNavidromeClick
             )
         }
         item {

@@ -1582,6 +1582,10 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var navidromeAddress by mutableStateOf("")
         private set
+    var navidromeUser by mutableStateOf("")
+        private set
+    var navidromePass by mutableStateOf("")
+        private set
     var navidromeAlbums by mutableStateOf<List<AlbumInfo>>(emptyList())
         private set
     var navidromeArtists by mutableStateOf<List<ArtistInfo>>(emptyList())
@@ -2834,6 +2838,37 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
 
     fun saveNavidrome(url: String, user: String, pass: String) {
         viewModelScope.launch { settings.saveNavidrome(url, user, pass) }
+    }
+
+    /** 设置页的「测试」：把已保存的配置重新走一遍 ping（保存会触发上面的 collector） */
+    fun recheckNavidrome() {
+        viewModelScope.launch {
+            val (u, user, pass) = settings.navidrome.first()
+            if (u.isBlank() || user.isBlank() || pass.isBlank()) {
+                toast("先填地址、用户名和密码")
+                return@launch
+            }
+            saveNavidrome(u, user, pass)
+        }
+    }
+
+    /** 断开曲库：清掉凭据，collector 会把连接状态与列表一并复位 */
+    fun clearNavidrome() {
+        viewModelScope.launch {
+            settings.clearNavidrome()
+            navidrome = null
+            navidromeConnected = false
+            navidromeError = null
+            navidromeChecking = false
+            navidromeAddress = ""
+            navidromeUser = ""
+            navidromePass = ""
+            navidromeAlbums = emptyList()
+            navidromeArtists = emptyList()
+            navidromePlaylists = emptyList()
+            navidromeTrackCount = 0
+            toast("已断开曲库")
+        }
     }
 
     // ---------------- 播放 ----------------
@@ -5969,9 +6004,13 @@ class MoyinViewModel(app: Application) : AndroidViewModel(app) {
                     navidromeConnected = false
                     navidromeError = null
                     navidromeAddress = ""
+                    navidromeUser = ""
+                    navidromePass = ""
                     return@collect
                 }
                 navidromeAddress = url
+                navidromeUser = user
+                navidromePass = pass
                 val c = NavidromeClient(url, user, pass).also { navidrome = it }
                 navidromeChecking = true
                 navidromeError = null
