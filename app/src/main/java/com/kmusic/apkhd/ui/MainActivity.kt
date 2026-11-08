@@ -371,6 +371,9 @@ fun MoyinRoot() {
                             // 重新进入搜索页要回到空白+历史，不能留着上次的结果
                             if (t == 1) vm.resetSearch()
                             tab = t
+                            // 子页面盖在主区上面，光切 tab 不会退出来 —— 用户看到的就是
+                            // 「点了首页却没反应」。切 Tab 一律回到该 Tab 的根页面。
+                            route = Route.None
                         },
                         modifier = Modifier
                             .align(Alignment.CenterStart)
@@ -751,6 +754,7 @@ fun MoyinRoot() {
                                     route = Route.DailyRecommend
                                 },
                                 onMyPlaylistsClick = { route = Route.MyPlaylists },
+                                onNavidromeClick = { route = Route.Navidrome },
                                 onNdAlbumClick = { a ->
                                     vm.openAlbum(a.id, a.name)
                                     route = Route.NdAlbum(a.id, a.name)
@@ -983,6 +987,8 @@ fun MoyinRoot() {
                                     // 重新进入搜索页要回到空白+历史，不能留着上次的结果
                                     if (t == 1) vm.resetSearch()
                                     tab = t
+                                    // 同侧栏：切 Tab 必须同时退出子页面
+                                    route = Route.None
                                 }
                             )
                         }
@@ -1170,6 +1176,7 @@ private fun HomeContent(
     onOpenRecentList: () -> Unit,
     onDailyClick: () -> Unit,
     onMyPlaylistsClick: () -> Unit = {},
+    onNavidromeClick: () -> Unit = {},
     onNdAlbumClick: (com.kmusic.apkhd.net.AlbumInfo) -> Unit = {},
     onNdSeeAll: () -> Unit = {}
 ) {
@@ -1177,7 +1184,10 @@ private fun HomeContent(
     // WebDAV 仍留在媒体库（它是「来源」，不是每天要点的东西）。
     // 本地音乐、收藏歌单是用户明确要求的：车机上这两个是最高频的，
     // 每次都要点「媒体库 → 再点一行」多两步。
-    val entries = remember(vm.dailyMix.size, vm.favorites.size, vm.localTracks.size, vm.favoritePlaylists.size) {
+    val entries = remember(
+        vm.dailyMix.size, vm.favorites.size, vm.localTracks.size,
+        vm.navidromeConnected, vm.navidromeTrackCount, vm.navidromeAddress
+    ) {
         listOf(
             QuickEntry(
                 "今日推荐",
@@ -1193,9 +1203,10 @@ private fun HomeContent(
                 if (vm.localTracks.isNotEmpty()) "${vm.localTracks.size} 首 · 已扫描" else "未扫描"
             ),
             QuickEntry(
-                "收藏的歌单",
-                if (vm.favoritePlaylists.isNotEmpty()) "${vm.favoritePlaylists.size} 个"
-                else "长按歌单封面收藏"
+                "Navidrome",
+                if (vm.navidromeConnected) "${vm.navidromeTrackCount} 首"
+                else if (vm.navidromeAddress.isBlank()) "未配置"
+                else "未连接"
             )
         )
     }
@@ -1230,7 +1241,7 @@ private fun HomeContent(
                 "今日推荐" -> onDailyClick()
                 "我喜欢的音乐" -> onFavoritesClick()
                 "本地音乐" -> onLocalClick()
-                "收藏的歌单" -> onMyPlaylistsClick()
+                "Navidrome" -> onNavidromeClick()
                 else -> onSearchClick()
             }
         },
